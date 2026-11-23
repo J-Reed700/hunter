@@ -59,7 +59,6 @@ class Flag:
     label: str
     arg: str = ""        # non-empty = takes a value (label for the input)
     help: str = ""
-    aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,7 +82,6 @@ class Cmd:
 _ALBUM = Flag("-a", "Album mode", help="match/operate on albums instead of tracks")
 _PATH = Flag("-p", "Show paths", help="print file paths instead of formatted rows")
 _FMT = Flag("-f", "Format", arg="format string", help="e.g. '$artist - $album' or '$id'")
-_PRETEND = Flag("-p", "Pretend", help="show what would change, change nothing")
 _FORCE = Flag("-f", "Force", help="re-do even if data already present")
 _NOMOVE = Flag("-M", "Don't move files", help="update tags/DB but leave paths alone")
 _NOWRITE = Flag("-W", "Don't write tags", help="update DB only, leave files untouched")
@@ -258,10 +256,12 @@ def _is_confined_container_path(
     if not val or "\x00" in val or "\\" in val:
         return False
     roots = _norm_allowed_roots(allowed_roots)
-    if not any(val.startswith(r + "/") for r in roots):
+    matched_root = next((r for r in roots if val.startswith(r + "/")), None)
+    if matched_root is None:
         return False
     parts = PurePosixPath(val).parts
-    return ".." not in parts and len(parts) >= 3
+    root_parts = PurePosixPath(matched_root).parts
+    return ".." not in parts and len(parts) > len(root_parts)
 
 
 def _validate_flag_value(
@@ -318,18 +318,45 @@ def _check_flag(
     return base
 
 
+def _present_flags(cmd: Cmd, argv: list[str]) -> set[str]:
+    """Return actual flag tokens in *argv[1:]*, skipping values of valued flags."""
+    valued = {f.flag for f in cmd.flags if f.arg}
+    present: set[str] = set()
+    skip = False
+    for tok in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if _looks_like_flag(tok):
+            base = tok.split("=", 1)[0]
+            present.add(base)
+            if base in valued and "=" not in tok:
+                skip = True
+    return present
+
+
+def _split_tokens(raw: str) -> list[str]:
+    try:
+        return shlex.split(raw)
+    except ValueError as exc:
+        raise PolicyError(f"invalid command quoting: {exc}") from exc
+
+
 def _apply_mode_flags(cmd: Cmd, argv: list[str], apply: bool) -> None:
+    present = _present_flags(cmd, argv)
     if apply:
         for f in cmd.confirm:
-            if f not in argv:
+            if f not in present:
                 argv.append(f)
+                present.add(f)
         return
     if cmd.cls != "mutate":
         return
     if cmd.pretend:
         for f in reversed(cmd.pretend):
-            if f not in argv:
+            if f not in present:
                 argv.insert(1, f)
+                present.add(f)
     elif not cmd.confirm:
         raise PolicyError(f"{cmd.name} does not support dry-run (run with apply=True)")
 
@@ -359,7 +386,7 @@ def build(name: str, *, query: str = "", options: dict | None = None,
             argv.append(flag)
     if not for_preview:
         _apply_mode_flags(cmd, argv, apply)
-    q_tokens = shlex.split(query) if query.strip() else []
+    q_tokens = _split_tokens(query) if query.strip() else []
     if cmd.query == "required" and not q_tokens:
         raise PolicyError(f"{cmd.name} needs a query — an empty query would touch the whole library")
     if cmd.query == "none" and q_tokens:
@@ -375,6 +402,11 @@ def build(name: str, *, query: str = "", options: dict | None = None,
         if s.startswith("-"):
             raise PolicyError(f"positional token {s!r} looks like a flag")
         pos_tokens.append(s)
+    if cmd.query == "none" and pos_tokens:
+        if not cmd.positional:
+            raise PolicyError(f"{cmd.name} takes no positional arguments")
+        if len(pos_tokens) > 1:
+            raise PolicyError(f"{cmd.name} takes at most one positional argument")
     argv += q_tokens
     argv += pos_tokens
     return argv
@@ -383,7 +415,7 @@ def build(name: str, *, query: str = "", options: dict | None = None,
 def build_raw(raw: str, apply: bool = False, *, for_preview: bool = False,
               allowed_roots: tuple[str, ...] | list[str] | None = None) -> list[str]:
     """Free-text build: `modify -a artist:Foo album:Bar year=1999`."""
-    toks = shlex.split(raw.strip())
+    toks = _split_tokens(raw.strip())
     if not toks:
         raise PolicyError("empty command")
     if toks[0] == "beet":
@@ -449,7 +481,8 @@ def query_of(argv: list[str]) -> tuple[Cmd | None, list[str], bool]:
     cmd = resolve(argv[0])
     if cmd is None:
         return None, [], False
-    album = ("-a" in argv[1:]) or cmd.album_native
+    flags = _present_flags(cmd, argv)
+    album = ("-a" in flags) or cmd.album_native
     toks: list[str] = []
     skip = False
     valued = {f.flag for f in cmd.flags if f.arg}
@@ -482,7 +515,10 @@ def needs_confirm(cmd: Cmd, query_tokens: list[str], count: int,
                   argv: list[str]) -> bool:
     if cmd.cls != "mutate":
         return False
-    if "-p" in argv and cmd.name in ("write", "update", "mbsync", "move",
+    if cmd.query == "none":
+        return False
+    flags = _present_flags(cmd, argv)
+    if "-p" in flags and cmd.name in ("write", "update", "mbsync", "move",
                                       "convert", "lyrics"):
         return False          # pretend modes change nothing
     return not query_tokens or count > SOFT_MAX

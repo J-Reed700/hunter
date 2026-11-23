@@ -61,10 +61,17 @@ class FinalizerTests(unittest.TestCase):
         Jobs(self.cfg).refresh()
         self.assertIn("finalized_ts", Jobs(self.cfg).get(jid)["meta"])
 
-    def test_ensure_finalizers_registered_imports_libops(self):
+    def test_explicit_finalizers_injection_and_missing_finalizer_deferred(self):
         jobs_mod._finalizers.pop("library", None)
-        jobs_mod.ensure_finalizers_registered()
-        self.assertIn("library", jobs_mod._finalizers)
+        jid = self._insert_finished_local_job("j_defer")
+        # Without a registered/injected finalizer for 'library', finalized_ts must NOT be stamped
+        Jobs(self.cfg).refresh()
+        self.assertNotIn("finalized_ts", Jobs(self.cfg).get(jid)["meta"])
+        # Injecting finalizers explicitly via Jobs(..., finalizers=...) finalizes it once
+        seen: list[str] = []
+        Jobs(self.cfg, finalizers={"library": lambda _j, job: seen.append(job["id"])}).refresh()
+        self.assertEqual(seen, [jid])
+        self.assertIn("finalized_ts", Jobs(self.cfg).get(jid)["meta"])
 
     def test_beets_probe_checks_exec_inspect_first_even_with_exit_in_log(self):
         log_dir = self.cfg.beets_automation_dir / "logs" / "jobs"

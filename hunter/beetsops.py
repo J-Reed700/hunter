@@ -15,7 +15,6 @@ Configured host/container paths:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import threading
@@ -23,12 +22,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hunter import domain
+from hunter import beetcmd, config as hunter_config, domain
 from hunter.config import HunterConfig
 from hunter.dockerctl import DockerClient, DockerError
-from hunter.jobs import Jobs, tail_file
-
-log = logging.getLogger("hunter.beetsops")
+from hunter.domain import tail_file
+from hunter.jobs import Jobs
 
 # --------------------------------------------------------------------------
 # Curated automation scripts (relative to cfg.beets_automation_container_dir/jobs)
@@ -48,34 +46,11 @@ def _cfg_from_jobs(jobs: Any, cfg: HunterConfig | None = None) -> HunterConfig |
     return None
 
 
-def _beets_python(cfg: Any = None) -> str:
-    val = getattr(cfg, "beets_python", None) if cfg is not None else None
-    return val.strip() if isinstance(val, str) and val.strip() else "python3"
-
-
-def _container_auto_dir(cfg: Any = None) -> str:
-    val = (
-        getattr(cfg, "beets_automation_container_dir", None)
-        if cfg is not None
-        else None
-    )
-    if isinstance(val, str) and val.strip():
-        return val.strip().rstrip("/") or "/config/automation"
-    return "/config/automation"
-
-
-def _container_quarantine_root(cfg: Any = None) -> str:
-    val = getattr(cfg, "beets_quarantine_root", None) if cfg is not None else None
-    if isinstance(val, str) and val.strip():
-        return val.strip().rstrip("/") or "/quarantine"
-    return "/quarantine"
-
-
 def _exec_argv(script: str, cfg: Any = None) -> list[str]:
     """Prefix the configured interpreter so script file modes never matter."""
-    path = f"{_container_auto_dir(cfg)}/jobs/{script.lstrip('/')}"
+    path = hunter_config.beets_job_script(cfg, script)
     if script.endswith(".py"):
-        return [_beets_python(cfg), path]
+        return [hunter_config.beets_python_bin(cfg), path]
     if script.endswith(".sh"):
         return ["sh", path]
     return [path]
@@ -253,6 +228,8 @@ def start_script(jobs: Jobs, script_id: str, *, apply: bool = False,
 # --------------------------------------------------------------------------
 
 class _Cache:
+    _MAX_KEYS = 200
+
     def __init__(self):
         self._d: dict = {}
         self._key_locks: dict = {}
@@ -262,9 +239,26 @@ class _Cache:
         with self._lock:
             lk = self._key_locks.get(key)
             if lk is None:
+                if len(self._key_locks) >= self._MAX_KEYS:
+                    for k in list(self._key_locks):
+                        if k not in self._d and not self._key_locks[k].locked():
+                            self._key_locks.pop(k, None)
                 lk = threading.Lock()
                 self._key_locks[key] = lk
             return lk
+
+    @staticmethod
+    def _is_failed(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if value.get("ok") is False or value.get("exec_ok") is False:
+            return True
+        sources = value.get("sources")
+        if isinstance(sources, list) and any(
+            isinstance(s, dict) and s.get("ok") is False for s in sources
+        ):
+            return True
+        return False
 
     def get(self, key, ttl, producer):
         now = time.monotonic()
@@ -279,9 +273,7 @@ class _Cache:
                 if hit and now - hit[0] < ttl:
                     return hit[1]
             value = producer()
-            if isinstance(value, dict) and (
-                value.get("ok") is False or value.get("exec_ok") is False
-            ):
+            if self._is_failed(value):
                 return value
             done_at = time.monotonic()
             with self._lock:
@@ -434,6 +426,28 @@ def _host_path(cfg: HunterConfig, container_path: str) -> Path | None:
     return domain.container_to_host_path(cfg, container_path, allow_quarantine=True)
 
 
+def _walk_confined(root: Path, *, max_files: int = 400) -> list[dict]:
+    """Walk *root* up to *max_files*, skipping any symlink escaping *root*."""
+    files: list[dict] = []
+    for r, _d, fs in os.walk(root):
+        for f in sorted(fs):
+            fp = Path(r) / f
+            if domain.resolve_under(root, fp) is None:
+                continue
+            try:
+                size = fp.stat().st_size
+            except OSError:
+                size = 0
+            files.append({
+                "name": str(fp.relative_to(root)),
+                "size": size,
+                "audio": fp.suffix.lower() in _AUDIO,
+            })
+            if len(files) >= max_files:
+                return files
+    return files
+
+
 def source_dirs(cfg: HunterConfig, docker: DockerClient, ttl: int = 20,
                 per_source: int = 60) -> dict:
     def produce():
@@ -451,9 +465,12 @@ def source_dirs(cfg: HunterConfig, docker: DockerClient, ttl: int = 20,
                     rows = []
                     with os.scandir(root) as it:
                         for e in it:
-                            if not e.is_dir(follow_symlinks=False):
+                            try:
+                                if not e.is_dir(follow_symlinks=False):
+                                    continue
+                                st = e.stat()
+                            except OSError:
                                 continue
-                            st = e.stat()
                             rows.append({"name": e.name, "mtime": st.st_mtime})
                     rows.sort(key=lambda r: r["mtime"], reverse=True)
                     entry["total"] = len(rows)
@@ -480,23 +497,7 @@ def source_dir_files(cfg: HunterConfig, docker: DockerClient, source: str,
         return None
     src, c_path = res
     root = _host_path(cfg, c_path)
-    files = []
-    if root and root.is_dir():
-        for r, _d, fs in os.walk(root):
-            for f in sorted(fs):
-                p = Path(r) / f
-                if domain.resolve_under(root, p) is None:
-                    continue
-                try:
-                    size = p.stat().st_size
-                except OSError:
-                    size = 0
-                files.append({"name": str(p.relative_to(root)), "size": size,
-                              "audio": p.suffix.lower() in _AUDIO})
-                if len(files) >= 400:
-                    break
-            if len(files) >= 400:
-                break
+    files = _walk_confined(root) if (root and root.is_dir()) else []
     return {"source": src, "path": c_path, "files": files,
             "audio": sum(1 for f in files if f["audio"])}
 
@@ -559,7 +560,11 @@ def quarantine_tree(cfg: HunterConfig, ttl: int = 120) -> dict:
             return {"ok": False, "error": f"{root} not mounted", "buckets": []}
         try:
             with os.scandir(root) as it:
-                tops = [e for e in it if e.is_dir()]
+                tops = [
+                    e for e in it
+                    if e.is_dir(follow_symlinks=False)
+                    and domain.resolve_under(root, Path(e.path)) is not None
+                ]
         except OSError as exc:
             return {"ok": False, "error": str(exc), "buckets": []}
         tops.sort(key=lambda e: e.name, reverse=True)
@@ -568,7 +573,11 @@ def quarantine_tree(cfg: HunterConfig, ttl: int = 120) -> dict:
             reasons = []
             try:
                 with os.scandir(top.path) as it_top:
-                    children = [c for c in it_top if c.is_dir()]
+                    children = [
+                        c for c in it_top
+                        if c.is_dir(follow_symlinks=False)
+                        and domain.resolve_under(root, Path(c.path)) is not None
+                    ]
             except OSError:
                 children = []
             for child in sorted(children, key=lambda c: c.name):
@@ -659,7 +668,7 @@ def quarantine_entries(cfg: HunterConfig, bucket: str, reason: str,
                 pass
             r["audio"] = audio
             r["reason_txt"] = reason_txt
-    q_root = _container_quarantine_root(cfg)
+    q_root = hunter_config.beets_quarantine_root_str(cfg)
     return {"bucket": bucket, "reason": reason, "total": total, "entries": page,
             "container_path": f"{q_root}/music/{bucket}/{reason}"}
 
@@ -675,21 +684,7 @@ def quarantine_entry(cfg: HunterConfig, bucket: str, reason: str,
     files = []
     reason_txt = ""
     if p.is_dir():
-        for r, _d, fs in os.walk(p):
-            for f in sorted(fs):
-                fp = Path(r) / f
-                if domain.resolve_under(p, fp) is None:
-                    continue
-                try:
-                    size = fp.stat().st_size
-                except OSError:
-                    size = 0
-                files.append({"name": str(fp.relative_to(p)), "size": size,
-                              "audio": fp.suffix.lower() in _AUDIO})
-                if len(files) >= 400:
-                    break
-            if len(files) >= 400:
-                break
+        files = _walk_confined(p)
         rt = p / "_reason.txt"
         if rt.is_file() and domain.resolve_under(p, rt) is not None:
             try:
@@ -703,7 +698,7 @@ def quarantine_entry(cfg: HunterConfig, bucket: str, reason: str,
             sz = 0
         files.append({"name": p.name, "size": sz,
                       "audio": p.suffix.lower() in _AUDIO})
-    q_root = _container_quarantine_root(cfg)
+    q_root = hunter_config.beets_quarantine_root_str(cfg)
     return {"bucket": bucket, "reason": reason, "name": name, "is_dir": p.is_dir(),
             "files": files, "reason_txt": reason_txt,
             "container_path": f"{q_root}/music/{bucket}/{reason}/{name}"}
@@ -775,13 +770,19 @@ def maintenance_reports(cfg: HunterConfig) -> list[dict]:
     d = cfg.beets_automation_dir / "logs"
     out = []
     try:
-        for f in d.iterdir():
-            if _REPORT_RE.match(f.name) and f.is_file():
-                st = f.stat()
-                out.append({"name": f.name, "size": st.st_size,
-                            "mtime": st.st_mtime})
+        entries = list(d.iterdir())
     except OSError:
-        pass
+        return []
+    for f in entries:
+        if not _REPORT_RE.match(f.name):
+            continue
+        try:
+            if not f.is_file():
+                continue
+            st = f.stat()
+        except OSError:
+            continue
+        out.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
     out.sort(key=lambda r: r["mtime"], reverse=True)
     return out[:40]
 
@@ -823,19 +824,111 @@ def maintenance_status(cfg: HunterConfig, ttl: int = 20) -> dict:
 
 def trigger_rescan(cfg: HunterConfig, docker: DockerClient,
                    app: str | None = None) -> dict:
-    cmd = [_beets_python(cfg),
-           f"{_container_auto_dir(cfg)}/services/trigger_rescan.py"]
+    cmd = [
+        hunter_config.beets_python_bin(cfg),
+        f"{hunter_config.beets_automation_dir_str(cfg)}/services/trigger_rescan.py",
+    ]
     if app and app != "all":
         if app not in ("navidrome", "plex", "jellyfin", "emby"):
             return {"ok": False, "error": "app must be navidrome|plex|jellyfin|emby"}
         cmd += ["--app", app]
     try:
         res = docker.exec_run(cfg.beets_container, cmd,
-                              user=getattr(cfg, "beets_exec_user", ""), timeout=120)
+                              user=hunter_config.beets_exec_user_str(cfg), timeout=120)
     except DockerError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": res["exit_code"] == 0, "exit_code": res["exit_code"],
             "output": res["output"][-2000:]}
+
+
+_SINGLE_PASS_COUNTER = (
+    "import subprocess,sys;"
+    "p=subprocess.Popen(sys.argv[1:],stdout=subprocess.PIPE,text=True,errors='replace');"
+    "n=0\n"
+    "for ln in p.stdout:\n"
+    " n+=1\n"
+    " if n<=40: sys.stdout.write(ln)\n"
+    "rc=p.wait()\n"
+    "print(f'__HUNTER_COUNT__={n}')\n"
+    "sys.exit(rc)"
+)
+
+
+def count_matches(
+    cfg: HunterConfig,
+    docker: DockerClient,
+    qtoks: list[str],
+    album: bool,
+    timeout: int = 90,
+) -> tuple[int, list[list[str]], int | None]:
+    """Single-pass blast radius: runs ``beet ls`` ONCE, preserves exit code."""
+    argv = beetcmd.beet_argv(cfg) + beetcmd.preview_argv(qtoks, album)
+    py = hunter_config.beets_python_bin(cfg)
+    res = docker.exec_run(
+        cfg.beets_container,
+        [py, "-c", _SINGLE_PASS_COUNTER, *argv],
+        user=hunter_config.beets_exec_user_str(cfg),
+        timeout=timeout,
+    )
+    count = 0
+    sample: list[list[str]] = []
+    for ln in res["output"].splitlines():
+        if ln.startswith("__HUNTER_COUNT__="):
+            try:
+                count = int(ln.split("=", 1)[1].strip())
+            except ValueError:
+                count = 0
+        elif ln.startswith("count="):
+            try:
+                count = int(ln[6:].strip())
+            except ValueError:
+                count = 0
+        elif "\t" in ln:
+            sample.append(ln.split("\t"))
+    return count, sample, res["exit_code"]
+
+
+def guard_mutation(
+    cfg: HunterConfig,
+    docker: DockerClient,
+    cmd: beetcmd.Cmd,
+    qtoks: list[str],
+    album: bool,
+    argv: list[str],
+    confirm_count: int | None,
+) -> tuple[int | None, tuple[int, dict[str, Any]] | None]:
+    """Enforce blast-radius cap and confirm_count for mutating beet commands.
+
+    Returns ``(count, None)`` when allowed to proceed, or
+    ``(count, (http_status, error_payload))`` when blocked.
+    """
+    if cmd.cls != "mutate" or cmd.query == "none":
+        return None, None
+    try:
+        count, sample, rc = count_matches(cfg, docker, qtoks, album)
+    except DockerError as exc:
+        return None, (502, {"error": f"preview count failed: {exc}"})
+    if rc != 0:
+        return None, (502, {"error": f"preview count failed (exit {rc})"})
+    if count == 0:
+        return 0, (400, {"error": "query matches 0 items — nothing to do"})
+    if count > beetcmd.HARD_MAX:
+        return count, (
+            400,
+            {"error": f"matches {count} ({'albums' if album else 'tracks'}), above hard cap {beetcmd.HARD_MAX}"},
+        )
+    if beetcmd.needs_confirm(cmd, qtoks, count, argv) and confirm_count != count:
+        return count, (
+            409,
+            {
+                "error": f"confirmation required: {count} {'albums' if album else 'tracks'}",
+                "needs_confirm": True,
+                "count": count,
+                "album": album,
+                "sample": sample[:20],
+            },
+        )
+    return count, None
 
 
 def load_schedule(cfg: HunterConfig | None = None) -> list[dict]:

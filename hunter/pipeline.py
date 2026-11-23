@@ -12,25 +12,23 @@ import os
 import re
 import sqlite3
 import time
+from contextlib import ExitStack
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from hunter import db, domain, storage
+from hunter import db, domain, libquery, storage
 from hunter.config import HunterConfig
 from hunter.library import BeetsLibrary
 from hunter.lock import LockBusy, hold
 from hunter.notify import Notifier
-from hunter.prowlarr import ProwlarrClient, ProwlarrError
+from hunter.prowlarr import ProwlarrClient, ProwlarrError, is_prowlarr_key
 from hunter.prowlarr import rank as rank_releases
-from hunter.slskd_client import SlskdClient, SlskdError, _norm_dir, rank_candidates
+from hunter.slskd_client import SlskdClient, SlskdError, norm_dir, rank_candidates
 from hunter.state import HunterState, Want
 
 log = logging.getLogger("hunter.pipeline")
 
 FAILURE_ALERT_AFTER = 3
-
-_LOSSLESS_SQL = "(" + ",".join(f"'{fmt}'" for fmt in sorted(domain.LOSSLESS_FORMATS)) + ")"
 
 
 def _date_minus_days(days: int) -> str:
@@ -40,10 +38,6 @@ def _date_minus_days(days: int) -> str:
 def _backoff(cfg: HunterConfig, attempts: int) -> int:
     idx = min(max(attempts - 1, 0), len(cfg.backoff_seconds) - 1)
     return cfg.backoff_seconds[idx]
-
-
-def _leaf_of(path: str) -> str:
-    return (path or "").rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def search_texts_for_want(want: Want) -> list[tuple[str, bool]]:
@@ -76,42 +70,14 @@ def gap_rows(
     min_expected: int = 4,
     max_expected: int = 40,
 ) -> list[tuple[int, str, str, int, int, int]]:
-    """Partial albums in beets: ``(id, artist, album, year, have, expected)``.
-    Sums per-disc ``MAX(tracktotal)`` so multi-disc albums aren't miscounted."""
-    cov = cfg.owned_coverage if coverage is None else float(coverage)
-    conn = db.open_readonly_db(cfg.beets_db)
-    try:
-        rows = conn.execute(
-            """
-            WITH disc_totals AS (
-                SELECT album_id, COALESCE(NULLIF(disc, 0), 1) AS d,
-                       COALESCE(MAX(tracktotal), 0) AS disc_total
-                FROM items
-                WHERE album_id IS NOT NULL
-                GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)
-            ),
-            album_totals AS (
-                SELECT album_id, SUM(disc_total) AS expected
-                FROM disc_totals
-                GROUP BY album_id
-            )
-            SELECT a.id, a.albumartist, a.album, a.year,
-                   COUNT(i.id) AS have, COALESCE(MAX(at.expected), 0) AS expected
-            FROM albums a
-            JOIN items i ON i.album_id = a.id
-            LEFT JOIN album_totals at ON at.album_id = a.id
-            WHERE a.albumartist NOT IN ('', 'Various Artists')
-            GROUP BY a.id
-            HAVING expected BETWEEN ? AND ?
-               AND have * 1.0 / expected < ?
-               AND expected - have >= ?
-            ORDER BY have * 1.0 / expected
-            """,
-            (min_expected, max_expected, cov, min_missing),
-        ).fetchall()
-        return [tuple(r) for r in rows]
-    finally:
-        conn.close()
+    """Partial albums in beets: ``(id, artist, album, year, have, expected)``."""
+    return libquery.gap_rows(
+        cfg,
+        coverage=coverage,
+        min_missing=min_missing,
+        min_expected=min_expected,
+        max_expected=max_expected,
+    )
 
 
 def lossy_rows(
@@ -119,24 +85,7 @@ def lossy_rows(
     min_tracks: int = 4,
 ) -> list[tuple[int, str, str, int, int]]:
     """Zero-lossless albums in beets: ``(id, artist, album, year, n)``."""
-    conn = db.open_readonly_db(cfg.beets_db)
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT a.id, a.albumartist, a.album, a.year, COUNT(i.id) AS n
-            FROM albums a JOIN items i ON i.album_id = a.id
-            WHERE a.albumartist NOT IN ('', 'Various Artists')
-            GROUP BY a.id
-            HAVING n >= ?
-               AND SUM(CASE WHEN UPPER(COALESCE(i.format, '')) IN {_LOSSLESS_SQL}
-                            THEN 1 ELSE 0 END) = 0
-            ORDER BY n DESC
-            """,
-            (min_tracks,),
-        ).fetchall()
-        return [tuple(r) for r in rows]
-    finally:
-        conn.close()
+    return libquery.lossy_rows(cfg, min_tracks=min_tracks)
 
 
 def seed_gaps(
@@ -166,6 +115,7 @@ def seed_gaps(
                     year or 0,
                     int(expected),
                     "gapfill",
+                    cfg=cfg,
                 )
             )
     return new
@@ -195,6 +145,7 @@ def seed_upgrades(
                     year or 0,
                     n,
                     "upgrade",
+                    cfg=cfg,
                 )
             )
     return new
@@ -326,19 +277,12 @@ def _quarantine_index(cfg: HunterConfig) -> dict[str, str]:
     return out
 
 
-def _want_rgid(want: Want) -> str | None:
-    for prefix in ("request:rg:", "release:rg:"):
-        if want.spotify_album_id.startswith(prefix):
-            return want.spotify_album_id[len(prefix):]
-    return None
-
-
 def _recovery_files_present(
     cfg: HunterConfig,
     album_id: int,
     expected_tracks: int | None,
 ) -> bool:
-    """Verify actual audio files exist on disk for *album_id* before allowing a
+    """Verify every beets track for *album_id* exists on disk before allowing a
     ``source == 'recovery'`` want to be marked ``done``."""
     try:
         conn = db.open_readonly_db(cfg.beets_db)
@@ -373,7 +317,8 @@ def _recovery_files_present(
     exp = expected_tracks or len(rows)
     if exp <= 0:
         return False
-    return (present / exp) >= cfg.owned_coverage
+    # Partial-loss albums (e.g. 8/10 tracks present) still need recovery until all DB rows exist on disk.
+    return present >= len(rows) and (present / exp) >= cfg.owned_coverage
 
 
 def _is_fast_fail(dl: dict | None, expected_tracks: int | None, min_coverage: float) -> bool:
@@ -427,7 +372,7 @@ def reconcile(
     def abandon(want: Want) -> None:
         if slskd is None or not want.grabbed_username or not want.grabbed_dir:
             return
-        if want.grabbed_username.startswith("prowlarr:"):
+        if is_prowlarr_key(want.grabbed_username):
             return
         try:
             n = slskd.cancel_dir(want.grabbed_username, want.grabbed_dir)
@@ -474,6 +419,32 @@ def reconcile(
             state.revert_to_wanted(want.id, _backoff(cfg, want.attempts))
             stats["reverted"] += 1
 
+    def reconcile_grab_or_misses(want: Want, miss_reason: str, *, log_unfindable: bool = False) -> None:
+        if want.status == "grabbed" and dl_states is not None:
+            dl = dl_states.get((want.grabbed_username or "", norm_dir(want.grabbed_dir or "")))
+            if _is_fast_fail(dl, want.track_count, cfg.owned_coverage):
+                fail_grab(want, fast=True)
+                return
+        if (
+            want.status == "grabbed"
+            and want.grabbed_ts
+            and now_ts - want.grabbed_ts > cfg.grab_stale_seconds
+        ):
+            leaf = domain.dir_leaf(want.grabbed_dir or "")
+            q_reason = get_qindex().get(leaf) if leaf else None
+            fail_grab(want, fast=False, q_reason=q_reason)
+            return
+        if want.status == "wanted" and want.search_misses >= cfg.search_miss_cap:
+            state.set_status(want.id, "exhausted", miss_reason)
+            stats["exhausted"] += 1
+            if log_unfindable:
+                log.warning(
+                    "UNFINDABLE %s — %s (%d misses)",
+                    want.artist,
+                    want.album,
+                    want.search_misses,
+                )
+
     for want in state.all_open():
         # --- Upgrade wants ---------------------------------------------------
         if want.source == "upgrade" and want.spotify_album_id.startswith("upgrade:beets:"):
@@ -504,27 +475,9 @@ def reconcile(
                 log.info("UPGRADED %s — %s (%d lossless tracks)", want.artist, want.album, lossless)
                 continue
 
-            if want.status == "grabbed" and dl_states is not None:
-                dl = dl_states.get((want.grabbed_username or "", _norm_dir(want.grabbed_dir or "")))
-                if _is_fast_fail(dl, want.track_count, cfg.owned_coverage):
-                    fail_grab(want, fast=True)
-                    continue
-            if (
-                want.status == "grabbed"
-                and want.grabbed_ts
-                and now_ts - want.grabbed_ts > cfg.grab_stale_seconds
-            ):
-                leaf = _leaf_of(want.grabbed_dir or "")
-                q_reason = get_qindex().get(leaf) if leaf else None
-                fail_grab(want, fast=False, q_reason=q_reason)
-                continue
-            if want.status == "wanted" and want.search_misses >= cfg.search_miss_cap:
-                state.set_status(
-                    want.id,
-                    "exhausted",
-                    f"no lossless copy found in {want.search_misses} searches",
-                )
-                stats["exhausted"] += 1
+            reconcile_grab_or_misses(
+                want, f"no lossless copy found in {want.search_misses} searches"
+            )
             continue
 
         # --- Gap-fill wants --------------------------------------------------
@@ -535,7 +488,15 @@ def reconcile(
                 aid = None
             if aid is not None:
                 ac = lib.album_coverage(aid, want.track_count, cfg.owned_coverage)
-                if ac and ac.owned:
+                if ac is None:
+                    state.set_status(
+                        want.id,
+                        "done",
+                        f"beets album {aid} removed or merged",
+                    )
+                    stats["done"] += 1
+                    continue
+                if ac.owned:
                     state.set_status(
                         want.id,
                         "done",
@@ -555,12 +516,13 @@ def reconcile(
                     continue
 
         # --- Standard & recovery wants --------------------------------------
-        rgid = _want_rgid(want)
-        rg_result = lib.rg_owned(rgid, want.track_count, cfg.owned_coverage) if rgid else None
-        result = (
-            rg_result
-            if (rg_result and rg_result.owned)
-            else lib.owned(want.artist, want.album, want.track_count, cfg.owned_coverage)
+        rgid = domain.extract_rgid_from_key(want.spotify_album_id)
+        result = lib.lookup_owned(
+            want.artist,
+            want.album,
+            rgid=rgid,
+            expected_tracks=want.track_count,
+            min_coverage=cfg.owned_coverage,
         )
         if result.owned:
             disk_ok = True
@@ -584,31 +546,11 @@ def reconcile(
                 )
                 continue
 
-        if want.status == "wanted" and want.search_misses >= cfg.search_miss_cap:
-            state.set_status(
-                want.id,
-                "exhausted",
-                f"unfindable: {want.search_misses} searches, no viable candidate",
-            )
-            stats["exhausted"] += 1
-            log.warning("UNFINDABLE %s — %s (%d misses)", want.artist, want.album, want.search_misses)
-            continue
-
-        if want.status == "grabbed" and dl_states is not None:
-            dl = dl_states.get((want.grabbed_username or "", _norm_dir(want.grabbed_dir or "")))
-            if _is_fast_fail(dl, want.track_count, cfg.owned_coverage):
-                fail_grab(want, fast=True)
-                continue
-
-        if (
-            want.status == "grabbed"
-            and want.grabbed_ts
-            and now_ts - want.grabbed_ts > cfg.grab_stale_seconds
-        ):
-            leaf = _leaf_of(want.grabbed_dir or "")
-            q_reason = get_qindex().get(leaf) if leaf else None
-            fail_grab(want, fast=False, q_reason=q_reason)
-            continue
+        reconcile_grab_or_misses(
+            want,
+            f"unfindable: {want.search_misses} searches, no viable candidate",
+            log_unfindable=True,
+        )
 
     if stats["exhausted"] and notifier is not None:
         notifier.send(
@@ -784,7 +726,7 @@ def hunt(
                     want.album,
                     text,
                     best.username,
-                    _leaf_of(best.dir),
+                    domain.dir_leaf(best.dir),
                     best.audio_count,
                     best.lossless,
                     best.avg_bitrate,
@@ -873,7 +815,7 @@ def hunt(
                 cand.username,
                 cand.audio_count,
                 cand.avg_bitrate,
-                _leaf_of(cand.dir),
+                domain.dir_leaf(cand.dir),
             )
             break
         else:
@@ -941,8 +883,10 @@ def watch_artists(
             if t.strip()
         }
 
+        hit_deadline = False
         for rg in rgs:
             if time.time() > deadline:
+                hit_deadline = True
                 break
             if not rg.get("date"):
                 continue
@@ -1005,6 +949,7 @@ def watch_artists(
                 rg["year"],
                 tcount,
                 src,
+                cfg=cfg,
             )
             if new:
                 stats["new_wants"] += 1
@@ -1026,6 +971,8 @@ def watch_artists(
                     rg["album"],
                     rg["date"],
                 )
+        if hit_deadline:
+            break
         state.mark_artist_checked(artist["mbid"])
         stats["checked"] += 1
     return stats
@@ -1133,22 +1080,19 @@ def run_pass(
                     except (sqlite3.Error, OSError) as exc:
                         log.warning("beets DB unavailable (%s)", exc)
 
-                    slskd_cm = (
-                        SlskdClient(cfg.slskd_url, cfg.slskd_api_key)
-                        if cfg.slskd_configured
-                        else None
-                    )
-                    prowlarr_cm = (
-                        ProwlarrClient(cfg.prowlarr_url, cfg.prowlarr_api_key)
-                        if cfg.prowlarr_configured and cfg.prowlarr_fallback
-                        else None
-                    )
-
-                    try:
-                        if slskd_cm is not None:
-                            slskd_cm.__enter__()
-                        if prowlarr_cm is not None:
-                            prowlarr_cm.__enter__()
+                    with ExitStack() as stack:
+                        slskd_cm = (
+                            stack.enter_context(SlskdClient(cfg.slskd_url, cfg.slskd_api_key))
+                            if cfg.slskd_configured
+                            else None
+                        )
+                        prowlarr_cm = (
+                            stack.enter_context(
+                                ProwlarrClient(cfg.prowlarr_url, cfg.prowlarr_api_key)
+                            )
+                            if cfg.prowlarr_configured and cfg.prowlarr_fallback
+                            else None
+                        )
 
                         if lib is not None:
                             summary["reconcile"] = reconcile(
@@ -1174,11 +1118,6 @@ def run_pass(
                             summary["hunt"] = hunt_stats
                         elif not cfg.slskd_configured:
                             log.warning("slskd not configured — hunt skipped")
-                    finally:
-                        if prowlarr_cm is not None:
-                            prowlarr_cm.__exit__(None, None, None)
-                        if slskd_cm is not None:
-                            slskd_cm.__exit__(None, None, None)
 
                     if not skip_spotify and cfg.spotify_configured and time.time() < deadline:
                         from hunter import spsync
@@ -1284,8 +1223,8 @@ def run_pass(
                             False,
                             json.dumps({"apply": eff_apply, "error": str(exc)[:300]}),
                         )
-                except Exception:
-                    pass
+                except Exception as rec_exc:              # noqa: BLE001
+                    log.warning("failed to record crashed pass: %s", rec_exc)
                 return 1
     except LockBusy:
         log.info("another hunter pass is running — exiting cleanly")

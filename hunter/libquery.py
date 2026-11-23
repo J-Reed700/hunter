@@ -1472,8 +1472,20 @@ def albumtypes(cfg: HunterConfig) -> list[dict[str, Any]]:
         conn.close()
 
 
-def gap_rows(cfg: HunterConfig) -> list[dict[str, Any]]:
-    """Incomplete albums in beets (including missing whole discs on multi-disc sets)."""
+def gap_rows(
+    cfg: HunterConfig,
+    *,
+    coverage: float | None = None,
+    min_missing: int = 2,
+    min_expected: int = 4,
+    max_expected: int = 40,
+) -> list[tuple[int, str, str, int, int, int]]:
+    """Incomplete albums in beets: ``(id, artist, album, year, have, expected)``.
+
+    Uses ``_ALBUM_TOTAL_SUBQUERY`` so multi-disc albums with missing whole discs
+    are detected accurately alongside partial discs.
+    """
+    cov = cfg.owned_coverage if coverage is None else float(coverage)
     conn = connect(cfg)
     try:
         rows = conn.execute(
@@ -1483,58 +1495,61 @@ def gap_rows(cfg: HunterConfig) -> list[dict[str, Any]]:
             f" FROM albums a"
             f" JOIN items i ON i.album_id = a.id"
             f" {_ALBUM_TOTAL_SUBQUERY}"
-            f" WHERE a.comp = 0"
-            f"   AND a.albumartist != ''"
+            f" WHERE a.albumartist NOT IN ('', 'Various Artists')"
             f"   AND LOWER(a.albumartist) != 'various artists'"
             f"   AND a.album != ''"
             f" GROUP BY a.id"
-            f" HAVING expected >= 2 AND have < expected"
-            f" ORDER BY (expected - have) DESC, a.id"
+            f" HAVING expected BETWEEN ? AND ?"
+            f"    AND have * 1.0 / expected < ?"
+            f"    AND expected - have >= ?"
+            f" ORDER BY have * 1.0 / expected, a.id",
+            (min_expected, max_expected, cov, min_missing),
         ).fetchall()
         return [
-            {
-                "album_id": int(r["id"]),
-                "artist": str(r["albumartist"]),
-                "album": str(r["album"]),
-                "year": int(r["year"] or 0),
-                "have": int(r["have"]),
-                "expected": int(r["expected"]),
-            }
+            (
+                int(r["id"]),
+                str(r["albumartist"]),
+                str(r["album"]),
+                int(r["year"] or 0),
+                int(r["have"]),
+                int(r["expected"]),
+            )
             for r in rows
         ]
     finally:
         conn.close()
 
 
-def lossy_rows(cfg: HunterConfig) -> list[dict[str, Any]]:
-    """All-lossy studio albums in beets eligible for lossless upgrade."""
+def lossy_rows(
+    cfg: HunterConfig,
+    *,
+    min_tracks: int = 4,
+) -> list[tuple[int, str, str, int, int]]:
+    """Zero-lossless albums in beets: ``(id, artist, album, year, n)``."""
     conn = connect(cfg)
     try:
         rows = conn.execute(
             f"SELECT a.id, a.albumartist, a.album, COALESCE(a.year, 0) AS year,"
-            f"       COUNT(i.id) AS tracks,"
-            f"       COALESCE(MAX(_at.expected_tracks), 0) AS expected,"
-            f"       SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) AS lossless_n"
+            f"       COUNT(i.id) AS n"
             f" FROM albums a"
             f" JOIN items i ON i.album_id = a.id"
-            f" {_ALBUM_TOTAL_SUBQUERY}"
-            f" WHERE a.comp = 0"
-            f"   AND a.albumartist != ''"
+            f" WHERE a.albumartist NOT IN ('', 'Various Artists')"
             f"   AND LOWER(a.albumartist) != 'various artists'"
             f"   AND a.album != ''"
             f" GROUP BY a.id"
-            f" HAVING tracks > 0 AND lossless_n = 0"
-            f" ORDER BY tracks DESC, a.id"
+            f" HAVING n >= ?"
+            f"    AND SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0"
+            f" ORDER BY n DESC, a.id",
+            (min_tracks,),
         ).fetchall()
         return [
-            {
-                "album_id": int(r["id"]),
-                "artist": str(r["albumartist"]),
-                "album": str(r["album"]),
-                "year": int(r["year"] or 0),
-                "tracks": int(r["tracks"]),
-                "expected": int(r["expected"] or r["tracks"]),
-            }
+            (
+                int(r["id"]),
+                str(r["albumartist"]),
+                str(r["album"]),
+                int(r["year"] or 0),
+                int(r["n"]),
+            )
             for r in rows
         ]
     finally:

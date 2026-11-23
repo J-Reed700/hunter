@@ -22,48 +22,37 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import threading
 import time
+from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from hunter import blocklist, domain, libquery
+from hunter import blocklist, config as hunter_config, domain, libquery
 from hunter.config import HunterConfig
 from hunter.dockerctl import DockerClient, DockerError
-from hunter.jobs import Jobs, register_finalizer, tail_file
+
+if TYPE_CHECKING:
+    from hunter.jobs import Jobs
 
 log = logging.getLogger("hunter.libops")
 
-J = "/config/automation/jobs"
-REMOVE_SCRIPT = f"{J}/library_remove.py"
-BLOCKLIST_SCRIPT = f"{J}/blocklist_ctl.py"
 PRUNE_SUBDIR = "library_prune"
 HUGE = 5000                       # mirrors the script's --allow-huge cap
 TYPED_CONFIRM_TRACKS = 30         # UI: ask to type the name above this
 
 
-def _beets_python(cfg: Any) -> str:
-    val = getattr(cfg, "beets_python", None)
-    return val.strip() if isinstance(val, str) and val.strip() else "python3"
-
-
-def _container_script(cfg: Any, name: str) -> str:
-    val = getattr(cfg, "beets_automation_container_dir", None)
-    base = (
-        val.strip().rstrip("/")
-        if isinstance(val, str) and val.strip()
-        else "/config/automation"
-    )
-    return f"{base}/jobs/{name}"
-
-
-def _container_quarantine_root(cfg: Any) -> str:
-    val = getattr(cfg, "beets_quarantine_root", None)
-    if isinstance(val, str) and val.strip():
-        return val.strip().rstrip("/")
-    return "/quarantine"
+def _parse_result_json(text: str) -> dict | None:
+    """Extract the last ``RESULT {...}`` JSON payload from script/job output."""
+    for line in reversed((text or "").splitlines()):
+        if line.startswith("RESULT "):
+            try:
+                parsed = json.loads(line[7:])
+                return parsed if isinstance(parsed, dict) else None
+            except ValueError:
+                return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -141,10 +130,11 @@ def removal_plan(cfg: HunterConfig, artists: list[str], album_ids: list[int],
                 chunk,
             ):
                 counts_by_aid[r["album_id"]] = int(r["n"])
+        mine_by_aid = Counter(r["album_id"] for r in items.values() if r["album_id"])
         for aid in need_counts:
             total = counts_by_aid.get(aid, 0)
-            mine = sum(1 for r in items.values() if r["album_id"] == aid)
-            if mine >= total:
+            mine = mine_by_aid.get(aid, 0)
+            if total > 0 and mine >= total:
                 full.add(aid)
             else:
                 partial.add(aid)
@@ -162,10 +152,12 @@ def removal_plan(cfg: HunterConfig, artists: list[str], album_ids: list[int],
     est_bytes = 0.0
     lossless = 0
     for r in items.values():
-        b = (r["length"] or 0) * (r["bitrate"] or 0) / 8.0
-        est_bytes += b
-        if (r["format"] or "").upper() in domain.LOSSLESS_FORMATS:
+        is_ll = (r["format"] or "").upper() in domain.LOSSLESS_FORMATS
+        if is_ll:
             lossless += 1
+        br = r["bitrate"] or (900_000 if is_ll else 256_000)
+        b = (r["length"] or 0) * br / 8.0
+        est_bytes += b
         aid = r["album_id"] or 0
         a = by_album.setdefault(aid, {
             "album_id": aid, "artist": r["albumartist"] or r["artist"] or "",
@@ -217,6 +209,32 @@ def _park_note(job_id: str) -> str:
     return f"parked by removal job {job_id}"
 
 
+def plan_park_keys(plan: dict) -> list[str]:
+    """Canonical want keys associated with the full albums in a removal plan."""
+    all_album_ids = plan.get("all_album_ids")
+    if all_album_ids is None:
+        all_album_ids = [
+            a["album_id"] for a in plan.get("albums", []) if a.get("full") and a.get("album_id")
+        ]
+    keys = [
+        f"{k}:beets:{aid}"
+        for aid in all_album_ids
+        if aid
+        for k in ("gapfill", "upgrade")
+    ]
+    keys += [f"recovery:a{aid}" for aid in all_album_ids if aid]
+    all_rgids = plan.get("all_rgids")
+    if all_rgids is None:
+        all_rgids = [
+            a["rgid"] for a in plan.get("albums", []) if a.get("full") and a.get("rgid")
+        ]
+    for rgid in all_rgids:
+        if rgid:
+            keys.append(f"request:rg:{rgid}")
+            keys.append(f"release:rg:{rgid}")
+    return keys
+
+
 def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
                   reason: str, requested_by: str, drop_wants: bool = True,
                   unfollow: bool = True, allow_huge: bool = False) -> dict:
@@ -230,11 +248,14 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
       compensate  on refuse  restore the parked wants, log "removal_failed"
 
     The reserve step exists so no pass can re-download the artist in the
-    window between "job started" and "files moved". _on_library_job (the
+    window between "job started" and "files moved". on_library_job (the
     kind="library" finalizer) does the confirm/compensate half."""
     t = plan["targets"]
-    job_id = jobs._new_id("library")
-    argv = [_beets_python(cfg), _container_script(cfg, "library_remove.py")]
+    job_id = jobs.new_id("library")
+    argv = [
+        hunter_config.beets_python_bin(cfg),
+        hunter_config.beets_job_script(cfg, "library_remove.py"),
+    ]
     for a in t["artists"]:
         argv.append(f"--artist={a}")
     for aid in t["album_ids"]:
@@ -251,16 +272,7 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
     label = _label(plan)
     # artist-wide parking ONLY for explicit artist targets — an album
     # removal must not park the artist's other wants
-    all_album_ids = plan.get("all_album_ids")
-    if all_album_ids is None:
-        all_album_ids = [a["album_id"] for a in plan["albums"] if a["full"] and a["album_id"]]
-    park_keys = [f"{k}:beets:{aid}" for aid in all_album_ids if aid
-                 for k in ("gapfill", "upgrade")]
-    park_keys += [f"recovery:a{aid}" for aid in all_album_ids if aid]
-    for rgid in (plan.get("all_rgids") or ()):
-        if rgid:
-            park_keys.append(f"request:rg:{rgid}")
-            park_keys.append(f"release:rg:{rgid}")
+    park_keys = plan_park_keys(plan)
     side_plan = {"drop_wants": bool(drop_wants), "unfollow": bool(unfollow),
                  "artists": t["artists"], "park_keys": park_keys,
                  "label": label, "tracks": plan["tracks"],
@@ -270,37 +282,34 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
     from hunter.state import HunterState
     parked = 0
     if drop_wants:
-        st = HunterState(cfg.state_db)
-        try:
+        with HunterState(cfg.state_db) as st:
             parked = st.park_wants(t["artists"], park_keys, _park_note(job_id))
-        finally:
-            st.close()
 
-    res = jobs.start_beets(
-        kind="library", title=f"Remove {label}", argv=argv, mode="apply",
-        meta={"op": "remove", "artists": t["artists"], "album_ids": t["album_ids"][:50],
-              "item_ids": t["item_ids"][:50], "tracks": plan["tracks"],
-              "album_rows": plan["album_rows"], "block": block, "reason": reason,
-              "requested_by": requested_by, "fingerprint": plan["fingerprint"],
-              "side": side_plan},
-        exclusive="library:remove", job_id=job_id)
+    try:
+        res = jobs.start_beets(
+            kind="library", title=f"Remove {label}", argv=argv, mode="apply",
+            meta={"op": "remove", "artists": t["artists"], "album_ids": t["album_ids"][:50],
+                  "item_ids": t["item_ids"][:50], "tracks": plan["tracks"],
+                  "album_rows": plan["album_rows"], "block": block, "reason": reason,
+                  "requested_by": requested_by, "fingerprint": plan["fingerprint"],
+                  "side": side_plan},
+            exclusive="library:remove", job_id=job_id)
+    except BaseException:
+        if drop_wants and parked:
+            with HunterState(cfg.state_db) as st:
+                st.restore_parked(_park_note(job_id))
+        raise
     if not res["ok"]:
         if drop_wants and parked:
-            st = HunterState(cfg.state_db)
-            try:
+            with HunterState(cfg.state_db) as st:
                 st.restore_parked(_park_note(job_id))
-            finally:
-                st.close()
         return res
 
-    st = HunterState(cfg.state_db)
-    try:
+    with HunterState(cfg.state_db) as st:
         st.log_event("removal", label, "",
                      f"started by {requested_by or 'ui'} · {plan['tracks']} tracks"
                      f" · {plan['album_rows']} albums{' · block' if block else ''}"
                      f"{' · ' + reason if reason else ''} · job {job_id}")
-    finally:
-        st.close()
     res["side"] = {"wants_parked": parked, "unfollowed": [],
                    "deferred": "unfollow and the event feed land when the job finishes"}
     return res
@@ -342,9 +351,8 @@ def _finish_removal(cfg: HunterConfig, job: dict, meta: dict) -> None:
     if not result and job["status"] in ("killed", "lost", "failed"):
         touched = _run_for_job(cfg, job, side) is not None
     from hunter.state import HunterState
-    st = HunterState(cfg.state_db)
-    try:
-        if job["status"] == "ok" or touched:
+    with HunterState(cfg.state_db) as st:
+        if (job["status"] == "ok" and result.get("ok") is not False) or touched:
             unfollowed: list[str] = []
             if side.get("unfollow") and side.get("artists"):
                 low = {n.casefold() for n in side["artists"]}
@@ -360,7 +368,7 @@ def _finish_removal(cfg: HunterConfig, job: dict, meta: dict) -> None:
                       f" · by {who}{' · ' + side['reason'] if side.get('reason') else ''}")
             for name in side.get("artists") or [None]:
                 st.log_event("removed", name or "", "" if name else label, detail)
-            if job["status"] != "ok":
+            if job["status"] != "ok" or result.get("ok") is False:
                 st.log_event("removal_incomplete", label, "",
                              f"job {job['id']} ended {job['status']} after moving files"
                              " — wants stay parked; check Library → Removed")
@@ -373,8 +381,6 @@ def _finish_removal(cfg: HunterConfig, job: dict, meta: dict) -> None:
             st.log_event("removal_failed", label, "",
                          f"{why} · {restored} parked want(s) restored · by {who}")
             log.warning("removal %s failed: %s (%d wants restored)", job["id"], why, restored)
-    finally:
-        st.close()
     _invalidate_library()
     blocklist.invalidate()
 
@@ -403,9 +409,9 @@ def _finish_undo(cfg: HunterConfig, job: dict, meta: dict) -> None:
     blocklist.invalidate()
 
 
-def _on_library_job(jobs: Jobs, job: dict) -> None:
-    """Finalizer for kind="library" (registered below): the confirm /
-    compensate half of start_removal and start_undo."""
+def on_library_job(jobs: Jobs, job: dict) -> None:
+    """Finalizer for kind="library": the confirm/compensate half of
+    start_removal and start_undo. Wired into Jobs from Layer 5 composition roots."""
     meta = job.get("meta") or {}
     op = meta.get("op")
     if op == "remove":
@@ -419,7 +425,7 @@ def _on_library_job(jobs: Jobs, job: dict) -> None:
 # --------------------------------------------------------------------------
 
 _PREFLIGHT_LOCK = threading.Lock()
-_PREFLIGHT: dict = {"ts": 0.0, "res": None}
+_PREFLIGHT: dict[tuple[str, str], tuple[float, dict]] = {}
 
 
 def removal_preflight(cfg: HunterConfig, *, max_age: float = 30.0,
@@ -427,35 +433,42 @@ def removal_preflight(cfg: HunterConfig, *, max_age: float = 30.0,
     """Can a removal run RIGHT NOW, according to the container that would run
     it? `library_remove.py --preflight` checks that both storage roots are
     live mounts of the union, the quarantine is writable and has room."""
+    cache_key = (
+        str(getattr(cfg, "beets_container", "beets")),
+        hunter_config.beets_quarantine_root_str(cfg),
+    )
     with _PREFLIGHT_LOCK:
-        now = time.time()
-        if not force and _PREFLIGHT["res"] and now - _PREFLIGHT["ts"] < max_age:
-            res = dict(_PREFLIGHT["res"])
+        now_mono = time.monotonic()
+        cached = _PREFLIGHT.get(cache_key)
+        if not force and cached and (now_mono - cached[0]) < max_age:
+            res = dict(cached[1])
         else:
             docker = DockerClient(cfg.docker_sock)
             if not docker.available:
                 res = {"ok": False, "error": "docker socket not mounted — beets console offline"}
             else:
                 try:
-                    r = docker.exec_run(cfg.beets_container,
-                                        [_beets_python(cfg),
-                                         _container_script(cfg, "library_remove.py"),
-                                         "--preflight"],
-                                        user=getattr(cfg, "beets_exec_user", ""),
-                                        timeout=25)
-                    res = {}
-                    for line in reversed(r["output"].strip().splitlines()):
-                        if line.startswith("RESULT "):
-                            res = json.loads(line[7:])
-                            break
-                    if not res:
-                        res = {"ok": False, "error": f"preflight gave no RESULT (rc={r['exit_code']}):"
-                                                     f" {r['output'][-200:]}"}
-                except (DockerError, ValueError) as exc:
+                    r = docker.exec_run(
+                        cfg.beets_container,
+                        [
+                            hunter_config.beets_python_bin(cfg),
+                            hunter_config.beets_job_script(cfg, "library_remove.py"),
+                            "--preflight",
+                        ],
+                        user=hunter_config.beets_exec_user_str(cfg),
+                        timeout=25,
+                    )
+                    parsed = _parse_result_json(r["output"])
+                    res = parsed if parsed is not None else {
+                        "ok": False,
+                        "error": f"preflight gave no RESULT (rc={r['exit_code']}): {r['output'][-200:]}",
+                    }
+                except DockerError as exc:
                     res = {"ok": False, "error": f"preflight failed: {exc}"}
-            res["checked_ts"] = int(now)
+            done_mono = time.monotonic()
+            res["checked_ts"] = int(time.time())
             if res.get("ok"):
-                _PREFLIGHT.update(ts=now, res=dict(res))
+                _PREFLIGHT[cache_key] = (done_mono, dict(res))
     if res.get("ok") and need_bytes > 0:
         free = (res.get("quarantine") or {}).get("free_bytes")
         need = need_bytes * 1.05 + 1_000_000_000
@@ -555,7 +568,7 @@ def removal(cfg: HunterConfig, run_id: str) -> dict | None:
                         "art": bool(a.get("art_dst"))} for a in m.get("albums", [])]
     s["extras"] = len(m.get("extras", []))
     s["errors_detail"] = m.get("errors", [])[:50]
-    q_root = _container_quarantine_root(cfg)
+    q_root = hunter_config.beets_quarantine_root_str(cfg)
     s["manifest"] = f"{q_root}/{PRUNE_SUBDIR}/{run_id}/manifest.json"
     s["run_dir"] = f"{q_root}/{PRUNE_SUBDIR}/{run_id}"
     return s
@@ -569,19 +582,20 @@ def start_undo(cfg: HunterConfig, jobs: Jobs, run_id: str, requested_by: str) ->
         return {"ok": False, "error": "already undone"}
     res = jobs.start_beets(
         kind="library", title=f"Undo removal · {', '.join(s['artists'][:2]) or run_id}",
-        argv=[_beets_python(cfg), _container_script(cfg, "library_remove.py"),
-              "--undo", s["manifest"], "--apply"], mode="apply",
+        argv=[
+            hunter_config.beets_python_bin(cfg),
+            hunter_config.beets_job_script(cfg, "library_remove.py"),
+            "--undo", s["manifest"], "--apply",
+        ],
+        mode="apply",
         meta={"op": "undo", "removal": run_id, "requested_by": requested_by},
         exclusive="library:remove")
     if res["ok"]:
         # "restored" is logged by the finalizer once the files are back.
         from hunter.state import HunterState
-        st = HunterState(cfg.state_db)
-        try:
+        with HunterState(cfg.state_db) as st:
             st.log_event("undo", ", ".join(s["artists"][:3]) or run_id, "",
                          f"undo of {run_id} started by {requested_by or 'ui'} · job {res['job']['id']}")
-        finally:
-            st.close()
     return res
 
 
@@ -589,13 +603,7 @@ def job_result(job: dict) -> dict | None:
     """The `RESULT {...}` line a finished library job printed, if any."""
     if not job or job.get("status") == "running":
         return None
-    for line in reversed(tail_file(job["log"], lines=6).splitlines()):
-        if line.startswith("RESULT "):
-            try:
-                return json.loads(line[7:])
-            except ValueError:
-                return None
-    return None
+    return _parse_result_json(domain.tail_file(job["log"], lines=6))
 
 
 # --------------------------------------------------------------------------
@@ -617,30 +625,46 @@ def blocklist_edit(cfg: HunterConfig, docker: DockerClient, *, add: list[str],
     out: dict = {"ok": True, "added": [], "skipped": [], "removed": [], "missing": []}
     if not docker.available:
         return {"ok": False, "error": "docker socket not mounted"}
-    for op, names in (("add", add), ("remove", remove)):
-        names = [n.strip() for n in names if n and n.strip()][:200]
-        if not names:
-            continue
-        try:
-            res = docker.exec_run(cfg.beets_container,
-                                  [_beets_python(cfg),
-                                   _container_script(cfg, "blocklist_ctl.py"),
-                                   "--json", op, "--", *names],
-                                  user=getattr(cfg, "beets_exec_user", ""),
-                                  timeout=30)
-        except DockerError as exc:
-            return {"ok": False, "error": str(exc)}
-        try:
-            payload = json.loads(res["output"].strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return {"ok": False, "error": f"blocklist_ctl {op} rc={res['exit_code']}: "
-                                          f"{res['output'][:200]}"}
-        if not payload.get("ok"):
-            return {"ok": False, "error": payload.get("error", "blocklist edit failed")}
-        for k in ("added", "skipped", "removed", "missing"):
-            out[k] += payload.get(k, [])
-        out["count"] = payload.get("count")
-    blocklist.invalidate()
+    changed = False
+    try:
+        for op, names in (("add", add), ("remove", remove)):
+            names = [n.strip() for n in names if n and n.strip()][:200]
+            if not names:
+                continue
+            try:
+                res = docker.exec_run(
+                    cfg.beets_container,
+                    [
+                        hunter_config.beets_python_bin(cfg),
+                        hunter_config.beets_job_script(cfg, "blocklist_ctl.py"),
+                        "--json", op, "--", *names,
+                    ],
+                    user=hunter_config.beets_exec_user_str(cfg),
+                    timeout=30,
+                )
+            except DockerError as exc:
+                out["ok"] = False
+                out["error"] = str(exc)
+                return out
+            try:
+                payload = json.loads(res["output"].strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                out["ok"] = False
+                out["error"] = (
+                    f"blocklist_ctl {op} rc={res['exit_code']}: {res['output'][:200]}"
+                )
+                return out
+            if not payload.get("ok"):
+                out["ok"] = False
+                out["error"] = payload.get("error", "blocklist edit failed")
+                return out
+            changed = True
+            for k in ("added", "skipped", "removed", "missing"):
+                out[k] += payload.get(k, [])
+            out["count"] = payload.get("count")
+    finally:
+        if changed:
+            blocklist.invalidate()
     return out
 
 
@@ -654,8 +678,19 @@ def blocklist_delta_for_wants(cfg: HunterConfig, names: list[str]) -> int:
         return st.drop_wants_for_blocked(norm_keys)
 
 
-__all__ = ["removal_plan", "start_removal", "removals", "removal", "start_undo",
-           "removal_preflight", "job_result", "blocklist_view", "blocklist_edit",
-           "blocklist_delta_for_wants", "TYPED_CONFIRM_TRACKS", "HUGE"]
-
-register_finalizer("library", _on_library_job)
+__all__ = [
+    "HUGE",
+    "TYPED_CONFIRM_TRACKS",
+    "blocklist_delta_for_wants",
+    "blocklist_edit",
+    "blocklist_view",
+    "job_result",
+    "on_library_job",
+    "plan_park_keys",
+    "removal",
+    "removal_preflight",
+    "removal_plan",
+    "removals",
+    "start_removal",
+    "start_undo",
+]
