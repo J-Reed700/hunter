@@ -195,7 +195,7 @@ def ensure_job(
         "plan": plan,
         "cursor": {},
         "stages": (job or {}).get("stages", {}),
-        "pace": (job or {}).get("pace", 0),
+        "pace": 0,
         "requests": 0,
         "new_wants": 0,
         "detail": "",
@@ -226,44 +226,79 @@ def cooldown_remaining(state: HunterState) -> int:
 # --- stage runners -----------------------------------------------------------
 
 
-def _stage_playlists(ctx: _Ctx) -> None:
-    job, state, cfg = ctx.job, ctx.state, ctx.cfg
+def _compile_exclude(pattern: str) -> re.Pattern[str] | None:
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error as exc:
+        log.warning("ignoring invalid HUNTER_PLAYLIST_EXCLUDE regex %r: %s", pattern, exc)
+        return None
+
+
+def _run_paged_stage(
+    ctx: _Ctx,
+    *,
+    stage_key: str,
+    label: str,
+    fetch_page,
+    apply_items,
+    on_complete,
+) -> None:
+    """Shared cursor-resumable pagination skeleton with atomic final sweep."""
+    job, state = ctx.job, ctx.state
     offset = int(job["cursor"].get("offset", 0))
-    gen = job["gen"]
-    exclude = (
-        re.compile(cfg.playlist_exclude, re.IGNORECASE)
-        if cfg.playlist_exclude
-        else None
-    )
-    known = {r["spotify_id"]: r["track_count"] for r in state.playlists()}
     while True:
         ctx.check()
-        items, total = ctx.gql.library_page("Playlists", offset)
+        items, total = fetch_page(offset)
         ctx.paged()
         with state.transaction():
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                parsed = spgql.parse_library_playlist(item)
-                if not parsed:
-                    continue
-                pid, name, owner, count = parsed
-                if exclude and exclude.search(name):
-                    continue
-                state.upsert_playlist(pid, name, count or known.get(pid, 0))
-                state.sp_mark_playlist(pid, gen, owner)
+            apply_items(items)
             offset += len(items)
-            done = _page_done(items, offset, total, "playlist roster")
+            done = _page_done(items, offset, total, label)
             job["cursor"] = {} if done else {"offset": offset}
+            if done:
+                job["stages"][stage_key] = on_complete()
             ctx.save()
         if done:
-            removed = state.sp_sweep_playlists(gen)
-            job["stages"]["playlists"] = {
-                "ts": int(time.time()),
-                "count": state.sp_counts()["playlists"],
-                "removed": removed,
-            }
             return
+
+
+def _stage_playlists(ctx: _Ctx) -> None:
+    job, state, cfg = ctx.job, ctx.state, ctx.cfg
+    gen = job["gen"]
+    exclude = _compile_exclude(cfg.playlist_exclude)
+    known = {r["spotify_id"]: r["track_count"] for r in state.playlists()}
+
+    def _apply(items: list) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            parsed = spgql.parse_library_playlist(item)
+            if not parsed:
+                continue
+            pid, name, owner, count = parsed
+            if exclude and exclude.search(name):
+                continue
+            state.upsert_playlist(pid, name, count or known.get(pid, 0))
+            state.sp_mark_playlist(pid, gen, owner)
+
+    def _done() -> dict:
+        removed = state.sp_sweep_playlists(gen)
+        return {
+            "ts": int(time.time()),
+            "count": state.sp_counts()["playlists"],
+            "removed": removed,
+        }
+
+    _run_paged_stage(
+        ctx,
+        stage_key="playlists",
+        label="playlist roster",
+        fetch_page=lambda off: ctx.gql.library_page("Playlists", off),
+        apply_items=_apply,
+        on_complete=_done,
+    )
 
 
 def _sync_one_playlist(ctx: _Ctx, playlist_id: str, name: str) -> None:
@@ -296,15 +331,15 @@ def _sync_one_playlist(ctx: _Ctx, playlist_id: str, name: str) -> None:
                 t = spgql.parse_track(item.get("itemV2"))
                 if not t:
                     continue
+                aa = t.get("album_artist") or t["artist"]
                 if t.get("album_id"):
-                    album_artists.setdefault(
-                        t["album_id"], t.get("album_artist") or t["artist"]
-                    )
+                    album_artists.setdefault(t["album_id"], aa)
                 state.sp_upsert_track(
                     track_id=t["track_id"],
                     title=t["title"],
                     artist=t["artist"],
                     album=t["album"],
+                    album_artist=aa,
                     album_id=t["album_id"],
                     year=t["year"],
                     duration_s=t["duration_s"],
@@ -314,16 +349,16 @@ def _sync_one_playlist(ctx: _Ctx, playlist_id: str, name: str) -> None:
                 pos += 1
             offset += len(items)
             done = _page_done(items, offset, total, f"playlist {playlist_id}")
-            job["cursor"]["pl"] = (
-                {}
-                if done
-                else {"offset": offset, "gen": gen, "pos": pos, "pid": playlist_id}
-            )
+            if done:
+                state.sp_playlist_done(playlist_id, gen, total or pos)
+                job["cursor"].pop("pl", None)
+            else:
+                job["cursor"]["pl"] = {
+                    "offset": offset, "gen": gen, "pos": pos, "pid": playlist_id
+                }
             ctx.save()
         if done:
             break
-    state.sp_playlist_done(playlist_id, gen, total)
-    job["cursor"].pop("pl", None)
     _ingest_playlist_wants(ctx, playlist_id, name, album_artists=album_artists)
 
 
@@ -340,6 +375,8 @@ def ingest_playlist_wants(
         return 0
     if not state.playlist_flags().get(playlist_id, (False, True))[0]:
         return 0
+    # Warm the beets library snapshot BEFORE opening a state.db write transaction.
+    library.get_cached_library(cfg)
     added = skipped = 0
     aa_map = album_artists or {}
     with state.transaction():
@@ -355,6 +392,7 @@ def ingest_playlist_wants(
                 r["year"],
                 r["album_total"] or None,
                 f"playlist:{name}",
+                cfg=cfg,
             )
     if skipped:
         log.info(
@@ -410,108 +448,115 @@ def _stage_one_playlist(ctx: _Ctx) -> None:
 
 def _stage_saved_albums(ctx: _Ctx) -> None:
     job, state, cfg = ctx.job, ctx.state, ctx.cfg
-    offset = int(job["cursor"].get("offset", 0))
     gen = job["gen"]
     want_saved = "saved_albums" in cfg.want_sources
-    while True:
-        ctx.check()
-        items, total = ctx.gql.library_page("Albums", offset)
-        ctx.paged()
-        with state.transaction():
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                parsed = spgql.parse_library_album(item)
-                if not parsed:
-                    continue
-                aid, artist, name, year = parsed
-                state.sp_upsert_saved_album(aid, artist, name, year, 0, gen)
-                if want_saved and name and not _have(cfg, artist, name):
-                    job["new_wants"] += state.upsert_want(
-                        aid, artist, name, year, None, "saved_albums"
-                    )
-            offset += len(items)
-            done = _page_done(items, offset, total, "saved albums")
-            job["cursor"] = {} if done else {"offset": offset}
-            ctx.save()
-        if done:
-            removed = state.sp_sweep_saved_albums(gen)
-            job["stages"]["saved_albums"] = {
-                "ts": int(time.time()),
-                "count": state.sp_counts()["saved_albums"],
-                "removed": removed,
-            }
-            return
+    if want_saved:
+        # Warm beets snapshot outside state.db write transaction.
+        library.get_cached_library(cfg)
+
+    def _apply(items: list) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            parsed = spgql.parse_library_album(item)
+            if not parsed:
+                continue
+            aid, artist, name, year = parsed
+            state.sp_upsert_saved_album(aid, artist, name, year, 0, gen)
+            if want_saved and name and not _have(cfg, artist, name):
+                job["new_wants"] += state.upsert_want(
+                    aid, artist, name, year, None, "saved_albums", cfg=cfg
+                )
+
+    def _done() -> dict:
+        removed = state.sp_sweep_saved_albums(gen)
+        return {
+            "ts": int(time.time()),
+            "count": state.sp_counts()["saved_albums"],
+            "removed": removed,
+        }
+
+    _run_paged_stage(
+        ctx,
+        stage_key="saved_albums",
+        label="saved albums",
+        fetch_page=lambda off: ctx.gql.library_page("Albums", off),
+        apply_items=_apply,
+        on_complete=_done,
+    )
 
 
 def _stage_liked(ctx: _Ctx) -> None:
     job, state = ctx.job, ctx.state
-    offset = int(job["cursor"].get("offset", 0))
     gen = job["gen"]
-    while True:
-        ctx.check()
-        items, total = ctx.gql.liked_page(offset)
-        ctx.paged()
-        with state.transaction():
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                t = spgql.parse_track(item.get("track"))
-                if not t:
-                    continue
-                state.sp_upsert_track(
-                    track_id=t["track_id"],
-                    title=t["title"],
-                    artist=t["artist"],
-                    album=t["album"],
-                    album_id=t["album_id"],
-                    year=t["year"],
-                    duration_s=t["duration_s"],
-                    album_total=t.get("album_total", 0),
-                    liked_gen=gen,
-                )
-            offset += len(items)
-            done = _page_done(items, offset, total, "liked songs")
-            job["cursor"] = {} if done else {"offset": offset}
-            ctx.save()
-        if done:
-            state.sp_sweep_liked(gen)
-            job["stages"]["liked"] = {
-                "ts": int(time.time()),
-                "count": state.sp_counts()["liked"],
-            }
-            return
+
+    def _apply(items: list) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            t = spgql.parse_track(item.get("track"))
+            if not t:
+                continue
+            state.sp_upsert_track(
+                track_id=t["track_id"],
+                title=t["title"],
+                artist=t["artist"],
+                album=t["album"],
+                album_artist=t.get("album_artist") or t["artist"],
+                album_id=t["album_id"],
+                year=t["year"],
+                duration_s=t["duration_s"],
+                album_total=t.get("album_total", 0),
+                liked_gen=gen,
+            )
+
+    def _done() -> dict:
+        state.sp_sweep_liked(gen)
+        return {
+            "ts": int(time.time()),
+            "count": state.sp_counts()["liked"],
+        }
+
+    _run_paged_stage(
+        ctx,
+        stage_key="liked",
+        label="liked songs",
+        fetch_page=lambda off: ctx.gql.liked_page(off),
+        apply_items=_apply,
+        on_complete=_done,
+    )
 
 
 def _stage_artists(ctx: _Ctx) -> None:
     job, state = ctx.job, ctx.state
-    offset = int(job["cursor"].get("offset", 0))
     gen = job["gen"]
-    while True:
-        ctx.check()
-        items, total = ctx.gql.library_page("Artists", offset)
-        ctx.paged()
-        with state.transaction():
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                parsed = spgql.parse_library_artist(item)
-                if not parsed:
-                    continue
-                arid, name = parsed
-                state.sp_upsert_artist(arid, name, "", gen)
-            offset += len(items)
-            done = _page_done(items, offset, total, "followed artists")
-            job["cursor"] = {} if done else {"offset": offset}
-            ctx.save()
-        if done:
-            removed = state.sp_sweep_artists(gen)
-            job["stages"]["artists"] = {
-                "ts": int(time.time()),
-                "count": state.sp_counts()["artists"],
-                "removed": removed,
-            }
-            return
+
+    def _apply(items: list) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            parsed = spgql.parse_library_artist(item)
+            if not parsed:
+                continue
+            arid, name = parsed
+            state.sp_upsert_artist(arid, name, "", gen)
+
+    def _done() -> dict:
+        removed = state.sp_sweep_artists(gen)
+        return {
+            "ts": int(time.time()),
+            "count": state.sp_counts()["artists"],
+            "removed": removed,
+        }
+
+    _run_paged_stage(
+        ctx,
+        stage_key="artists",
+        label="followed artists",
+        fetch_page=lambda off: ctx.gql.library_page("Artists", off),
+        apply_items=_apply,
+        on_complete=_done,
+    )
 
 
 _STAGES = {
@@ -612,6 +657,11 @@ def continue_sync(
             job["pace"] = gql.pace
             job["status"] = "error"
             log.error("spotify sync failed: %s", exc)
+        except Exception as exc:                       # noqa: BLE001
+            job["detail"] = f"unexpected error: {exc}"[:300]
+            job["pace"] = gql.pace
+            job["status"] = "error"
+            log.exception("spotify sync crashed unexpectedly")
     _save(state, job)
     return job
 
@@ -645,15 +695,6 @@ def run_sync_job(
                     cfg.token_file,
                     proxy=cfg.spotify_proxy,
                 ) as spotify:
-                    if not spotify.has_sp_dc():
-                        job = ensure_job(state, scope, playlist_id)
-                        job["status"] = "error"
-                        job["detail"] = (
-                            "Spotify sync requires an sp_dc browser cookie "
-                            "(classic OAuth tokens cannot query web-player GraphQL)"
-                        )
-                        _save(state, job)
-                        return job
                     job = ensure_job(state, scope, playlist_id)
                     return continue_sync(
                         cfg,
@@ -730,7 +771,7 @@ class CachedSpotify:
                 duration_s=r["duration_s"],
                 album=SpAlbum(
                     id=r["album_id"],
-                    artist=r["artist"],
+                    artist=r["album_artist"] or r["artist"],
                     name=r["album"],
                     year=r["year"],
                     total_tracks=r["album_total"],

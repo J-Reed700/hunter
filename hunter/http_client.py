@@ -10,6 +10,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from datetime import datetime, timezone
 from typing import Any
 
@@ -128,6 +129,48 @@ class RateLimiter:
     def reset(self) -> None:
         with self._lock:
             self._next_slot = 0.0
+
+
+class PoliteClient:
+    """Shared rate-limited, per-thread ``HttpSession`` manager for public APIs
+    (MusicBrainz, ListenBrainz, Cover Art Archive).
+
+    Uses ``weakref.finalize`` on each thread so short-lived worker threads
+    automatically close their underlying ``requests.Session`` sockets on exit.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout: float = 12.0,
+        min_interval: float = 1.0,
+        component: str = "hunter",
+    ) -> None:
+        self._timeout = float(timeout)
+        self._component = component
+        self.limiter = RateLimiter(min_interval)
+        self._local = threading.local()
+
+    def user_agent(self, cfg: Any = None) -> str:
+        eff = cfg
+        if eff is None:
+            try:
+                from hunter.config import HunterConfig
+                eff = HunterConfig.from_env()
+            except Exception:
+                eff = None
+        return default_user_agent(eff, component=self._component)
+
+    def session(self, cfg: Any = None) -> HttpSession:
+        ua = self.user_agent(cfg)
+        sess: HttpSession | None = getattr(self._local, "http", None)
+        if sess is None:
+            sess = HttpSession(timeout=self._timeout, user_agent=ua)
+            self._local.http = sess
+            weakref.finalize(threading.current_thread(), sess.close)
+        else:
+            sess.headers["User-Agent"] = ua
+        return sess
 
 
 class HttpSession:
@@ -280,6 +323,7 @@ class HttpSession:
 __all__ = [
     "HttpError",
     "HttpSession",
+    "PoliteClient",
     "RateLimitError",
     "RateLimiter",
     "default_user_agent",
