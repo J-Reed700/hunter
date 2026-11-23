@@ -1,0 +1,72 @@
+services:
+  hunter:
+    build: .
+    container_name: hunter
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Run as your host user so /state files stay owned by you.
+    # If mounting /var/run/docker.sock for the beets console, also add your
+    # host's docker group GID (getent group docker | cut -d: -f3) via group_add.
+    # user: "1000:1000"
+    # group_add:
+    #   - "999"
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persistent state: hunter.db (wants, users, sessions, jobs), tokens, logs, backups
+      - ./state:/state
+
+      # Music library root (read-only). Hunter never writes or deletes media files.
+      - /path/to/music:/music:ro
+
+      # --- Optional integrations ---
+      # Beets config directory (musiclibrary.db, import.log).
+      # Mounted rw only so SQLite WAL readers can access the -shm sidecar; Hunter opens it mode=ro.
+      # - /path/to/beets/config:/beets
+
+      # Navidrome data directory (read-only) for play-weighted backlog prioritization.
+      # - /path/to/navidrome/data:/navidrome:ro
+
+      # Quarantine directory (read-only) for failed-import attribution & undoable removals.
+      # - /path/to/quarantine:/quarantine:ro
+
+      # Custom beets automation scripts & blocklist directory (read-only).
+      # - /path/to/beets-automation:/beets-automation:ro
+
+      # Docker socket (read-only) to enable container health checks and the Beets web console.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "hunter", "health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    # Optional: join an existing Docker network shared with slskd, Navidrome, beets, Prowlarr
+    # networks:
+    #   - media
+
+# Example sibling services (uncomment/adapt if running everything in one stack):
+#   slskd:
+#     image: slskd/slskd:latest
+#     container_name: slskd
+#     ...
+#
+#   navidrome:
+#     image: deluan/navidrome:latest
+#     container_name: navidrome
+#     ...
+#
+#   beets:
+#     image: lscr.io/linuxserver/beets:latest
+#     container_name: beets
+#     ...
+#
+#   prowlarr:
+#     image: lscr.io/linuxserver/prowlarr:latest
+#     container_name: prowlarr
+#     ...
+#
+# networks:
+#   media:
+#     external: true
