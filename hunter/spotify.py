@@ -7,7 +7,6 @@ persisted via config.save_spotify_token (atomic 0o600 merge-write).
 """
 from __future__ import annotations
 
-import base64
 import email.utils
 import hashlib
 import hmac

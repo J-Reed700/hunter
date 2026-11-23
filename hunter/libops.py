@@ -27,7 +27,7 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from hunter import blocklist, config as hunter_config, domain, libquery
 from hunter.config import HunterConfig

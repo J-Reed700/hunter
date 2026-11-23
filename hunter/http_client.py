@@ -90,9 +90,11 @@ def default_user_agent(cfg: Any = None, component: str = "hunter") -> str:
     app = app_cfg or (os.environ.get("HUNTER_APP_NAME") or "").strip() or "Hunter"
     comp = (component or "hunter").strip()
     base = f"{app}-{comp}/{__version__}"
-    contact = ""
-    if cfg is not None:
-        contact = (getattr(cfg, "user_agent_contact", "") or "").strip()
+    contact = (
+        (getattr(cfg, "user_agent_contact", "") or "").strip()
+        if cfg is not None
+        else ""
+    ) or (os.environ.get("HUNTER_USER_AGENT_CONTACT") or "").strip()
     return f"{base} ({contact})" if contact else base
 
 
@@ -152,14 +154,7 @@ class PoliteClient:
         self._local = threading.local()
 
     def user_agent(self, cfg: Any = None) -> str:
-        eff = cfg
-        if eff is None:
-            try:
-                from hunter.config import HunterConfig
-                eff = HunterConfig.from_env()
-            except Exception:
-                eff = None
-        return default_user_agent(eff, component=self._component)
+        return default_user_agent(cfg, component=self._component)
 
     def session(self, cfg: Any = None) -> HttpSession:
         ua = self.user_agent(cfg)
