@@ -1,5 +1,5 @@
 import { api, h, mount, fmt, toast, action, poll, link, cover, artUrl, setTopActions, refreshStatusSoon, can } from "../app.js";
-import { openWant, openJob, statusBadge } from "./_shared.js";
+import { openWant, openJob, statusBadge, statCard } from "./_shared.js";
 
 export default {
   async render(root) {
@@ -17,20 +17,19 @@ export default {
       ]);
       if (!root.isConnected) return;
       const c = p.counts || {};
-      const stat = (k, v, d, href, cls = "") => h("a", { class: "stat " + cls, href }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), d ? h("div", { class: "d" }, d) : null);
       mount(stats,
-        stat("Wanted", fmt.num(c.wanted || 0), "hunting on next pass", "#/queue?status=wanted"),
-        stat("Downloading", fmt.num(c.grabbed || 0), t?.slskd_ok ? `${t.queue_active} files active in slskd` : "slskd unreachable", "#/queue?status=grabbed"),
-        stat("Done", fmt.num(c.done || 0), "landed in beets", "#/queue?status=done"),
-        stat("Exhausted", fmt.num(c.exhausted || 0), "need a manual pick", "#/queue?status=exhausted", c.exhausted ? "warn" : ""),
-        p.library ? stat("Library", fmt.num(p.library.items), `${fmt.num(p.library.albums)} albums · +${p.library.added_24h} today · +${p.library.added_7d} this week`, "#/library") : null,
-        stat("Jobs", String(p.jobs.filter(j => j.status === "running").length), p.jobs.length ? `last: ${p.jobs[0].title.slice(0, 28)}` : "none yet", op ? "#/jobs" : "#/dashboard"));
+        statCard("Wanted", fmt.num(c.wanted || 0), "hunting on next pass", "#/queue?status=wanted"),
+        statCard("Downloading", fmt.num(c.grabbed || 0), t?.slskd_ok ? `${t.queue_active} files active in slskd` : "slskd unreachable", "#/queue?status=grabbed"),
+        statCard("Done", fmt.num(c.done || 0), "landed in beets", "#/queue?status=done"),
+        statCard("Exhausted", fmt.num(c.exhausted || 0), "need a manual pick", "#/queue?status=exhausted", c.exhausted ? "warn" : ""),
+        p.library ? statCard("Library", fmt.num(p.library.items), `${fmt.num(p.library.albums)} albums · +${p.library.added_24h} today · +${p.library.added_7d} this week`, "#/library") : null,
+        op ? statCard("Jobs", String(p.jobs.filter(j => j.status === "running").length), p.jobs.length ? `last: ${p.jobs[0].title.slice(0, 28)}` : "none yet", "#/jobs") : null);
 
       // in-flight downloads
       const inflight = (t?.grabbed || []).slice(0, 8);
       const dlCard = h("div", { class: "card" }, h("h3", {}, "Downloading", h("a", { class: "right", href: "#/queue?status=grabbed" }, "all →")),
         inflight.length ? h("div", { class: "list" }, ...inflight.map(w => { const dl = w.dl; const pct = dl ? dl.pct : 0; return h("div", { class: "item click", onClick: () => openWant(w.id) },
-          h("div", { class: "main" }, h("div", { class: "t" }, `${w.artist} — ${w.album}`), h("div", { class: "s" }, dl ? `${dl.succeeded}/${dl.total} files · ${pct}%${dl.errored ? ` · ${dl.errored} failed` : ""}` : "waiting for slskd…", h("span", { class: "mono" }, w.grabbed_username || "")), h("div", { class: "progress mt", style: { marginTop: "6px" } }, h("div", { class: dl?.errored ? "" : "", style: { width: pct + "%" } }))),
+          h("div", { class: "main" }, h("div", { class: "t" }, `${w.artist} — ${w.album}`), h("div", { class: "s" }, dl ? `${dl.succeeded}/${dl.total} files · ${pct}%${dl.errored ? ` · ${dl.errored} failed` : ""}` : "waiting for slskd…", h("span", { class: "mono" }, w.grabbed_username || "")), h("div", { class: "progress mt" + (dl?.errored ? " bad" : ""), style: { marginTop: "6px" } }, h("div", { style: { width: pct + "%" } }))),
           h("div", { class: "end" }, dl?.errored ? h("span", { class: "badge bad" }, "errors") : null)); })) : h("div", { class: "empty small" }, "Nothing in flight."));
 
       // passes

@@ -30,14 +30,18 @@ export default {
             mine && b.status !== "building" ? h("button", { class: "btn sm ghost", onClick: action(null, async () => { if (b.status === "ready" && !(await confirm({ title: "Delete this bundle?", body: "The zip is removed from the server; the library files are untouched.", ok: "Delete", danger: true }))) return; await api("/api/downloads/delete", { id: b.id }); load(); }) }, "Delete") : null));
       })));
     };
-    let building = false;
+    let building = false, ticks = 0;
     async function load() {
       const res = await api("/api/downloads");
+      if (!root.isConnected) return;
       building = !!(res.summary && res.summary.building);
       paint(res);
     }
     await load();
     if (!root.isConnected) return;
-    poll(async () => { if (building || document.visibilityState === "visible") await load(); }, 2500, { immediate: false });
+    poll(async () => {
+      ticks += 1;
+      if (building || ticks % 6 === 0) await load();
+    }, 2500, { immediate: false });
   },
 };

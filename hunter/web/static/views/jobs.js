@@ -4,7 +4,7 @@ import { openJob, statusBadge, modeBadge } from "./_shared.js";
 export default {
   async render(root, r) {
     if (r.q.id) { openJob(r.q.id); setQuery({ id: "" }); }
-    let kind = r.q.kind || "", status = r.q.status || "";
+    let kind = r.q.kind || "", status = r.q.status || "", loadGen = 0;
     const list = h("div", {});
     const chips = (items, cur, set) => h("div", { class: "chips" }, ...items.map(([k, l]) => h("span", { class: "chip" + (cur === k ? " active" : ""), onClick: () => set(k) }, l)));
     const bar = h("div", { class: "filterbar" });
@@ -14,8 +14,10 @@ export default {
       h("button", { class: "btn xs ghost ml-auto", onClick: action(null, async () => { const r = await api("/api/jobs/prune_logs", {}); toast(`${r.pruned} old logs removed`); }) }, "Prune logs >14d"));
     paintBar();
     async function load() {
-      const res = await api(`/api/jobs?kind=${encodeURIComponent(kind)}&status=${encodeURIComponent(status)}&limit=120`);
-      if (!root.isConnected) return;
+      const myGen = ++loadGen;
+      let res;
+      try { res = await api(`/api/jobs?kind=${encodeURIComponent(kind)}&status=${encodeURIComponent(status)}&limit=120`); } catch (e) { if (myGen === loadGen && root.isConnected) mount(list, h("div", { class: "notice bad" }, e.message)); return; }
+      if (myGen !== loadGen || !root.isConnected) return;
       const running = res.jobs.filter(j => j.status === "running"), done = res.jobs.filter(j => j.status !== "running");
       const row = (j) => h("tr", { class: "click", onClick: () => openJob(j.id) },
         h("td", {}, statusBadge(j.status)), h("td", {}, h("div", { class: "b ellip", style: { maxWidth: "520px" } }, j.title), j.status === "running" && j.progress ? h("div", { class: "row small muted", style: { gap: "6px" } }, h("div", { class: "progress striped", style: { width: "120px" } }, h("div", { style: { width: (j.progress.pct ?? 100) + "%", opacity: j.progress.pct === null ? ".35" : "1" } })), j.progress.pct !== null ? `${j.progress.pct}%` : "", h("span", { class: "ellip xs", style: { maxWidth: "360px" } }, j.progress.last || "")) : h("div", { class: "muted xs ellip", style: { maxWidth: "520px" } }, j.command)),

@@ -1,14 +1,13 @@
 import { api, h, mount, fmt, toast, action, busy, sel, setQuery, poll, confirm, refreshStatusSoon, setTopActions, store, onCleanup, can } from "../app.js";
-import { openWant, pickCandidates, statusBadge } from "./_shared.js";
+import { openWant, pickCandidates, statusBadge, debouncedInput } from "./_shared.js";
 
 const STATUSES = ["wanted", "grabbed", "exhausted", "done", "skipped"];
 
 export default {
   async render(root, r) {
     const op = can("operator");
-    let status = r.q.status || "wanted,grabbed,exhausted", source = r.q.source || "", q = r.q.q || "", sort = r.q.sort || "updated", offset = 0, rows = [], total = 0, timer = null;
-    onCleanup(() => clearTimeout(timer));
-    const input = h("input", { class: "input", placeholder: "filter artist / album", value: q });
+    let status = r.q.status || "wanted,grabbed,exhausted", source = r.q.source || "", q = r.q.q || "", sort = r.q.sort || "updated", offset = 0, rows = [], total = 0, loadGen = 0;
+    const input = debouncedInput({ placeholder: "filter artist / album", value: q, delay: 350, onInput: (v) => { q = v; setQuery({ q }); load(); } });
     const chips = h("div", { class: "chips" });
     const srcSel = h("select", { class: "select sm" });
     const sortSel = h("select", { class: "select sm" }, ...[["updated", "Recently updated"], ["created", "Newest"], ["artist", "Artist"], ["attempts", "Most attempts"], ["status", "Status"]].map(([v, l]) => h("option", { value: v, selected: sort === v }, l)));
@@ -22,7 +21,6 @@ export default {
     const paintChips = (counts = store.status?.counts || {}) => mount(chips, ...STATUSES.map(s => { const on = status.split(",").includes(s); return h("span", { class: "chip" + (on ? " active" : ""), onClick: () => { const set = new Set(status.split(",").filter(Boolean)); set.has(s) ? set.delete(s) : set.add(s); status = [...set].join(","); setQuery({ status }); load(); } }, s, counts[s] !== undefined ? h("span", { class: "n" }, fmt.num(counts[s])) : null); }));
     paintChips();
     onCleanup(store.on((s) => { if (root.isConnected) paintChips(s?.counts || {}); }));
-    input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { q = input.value.trim(); setQuery({ q }); load(); }, 350); });
     srcSel.addEventListener("change", () => { source = srcSel.value; setQuery({ source }); load(); });
     sortSel.addEventListener("change", () => { sort = sortSel.value; setQuery({ sort }); load(); });
     sel.configure("wants", [
@@ -32,12 +30,20 @@ export default {
 
     let dl = {};
     async function load(more = false) {
-      if (!more) offset = 0; else offset += 100;
-      const [res, t] = await Promise.all([
-        api(`/api/wants?status=${encodeURIComponent(status)}&source=${encodeURIComponent(source)}&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&limit=100&offset=${encodeURIComponent(offset)}`),
-        status.includes("grabbed") ? api("/api/transfers").catch(() => null) : null,
-      ]);
-      if (!root.isConnected) return;
+      const myGen = ++loadGen;
+      const nextOffset = more ? offset + 100 : 0;
+      let res, t;
+      try {
+        [res, t] = await Promise.all([
+          api(`/api/wants?status=${encodeURIComponent(status)}&source=${encodeURIComponent(source)}&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&limit=100&offset=${encodeURIComponent(nextOffset)}`),
+          status.includes("grabbed") ? api("/api/transfers").catch(() => null) : null,
+        ]);
+      } catch (e) {
+        if (myGen === loadGen && root.isConnected) mount(table, h("div", { class: "notice bad" }, e.message));
+        return;
+      }
+      if (myGen !== loadGen || !root.isConnected) return;
+      offset = nextOffset;
       rows = more ? rows.concat(res.wants) : res.wants; total = res.total;
       if (t) { dl = {}; for (const w of t.grabbed) dl[w.id] = w.dl; }
       mount(srcSel, h("option", { value: "" }, "All sources"), ...res.sources.map(s => h("option", { value: s, selected: s === source }, s)));
@@ -58,7 +64,7 @@ export default {
       const chk = op ? h("span", { class: "check" + (sel.has(w.id) ? " on" : ""), onClick: (e) => { e.stopPropagation(); chk.classList.toggle("on", sel.toggle(w.id, w)); tr.classList.toggle("sel", sel.has(w.id)); } }, "✓") : null;
       const tr = h("tr", { class: "click" + (sel.has(w.id) ? " sel" : ""), onClick: () => openWant(w.id) },
         op ? h("td", {}, chk) : null,
-        h("td", {}, statusBadge(w.status), w.status === "grabbed" && d ? h("div", { class: "progress mt", style: { width: "70px", marginTop: "4px" } }, h("div", { class: d.errored ? "" : "", style: { width: d.pct + "%" } })) : null),
+        h("td", {}, statusBadge(w.status), w.status === "grabbed" && d ? h("div", { class: "progress mt" + (d.errored ? " bad" : ""), style: { width: "70px", marginTop: "4px" } }, h("div", { style: { width: d.pct + "%" } })) : null),
         h("td", {}, h("div", { class: "b ellip", style: { maxWidth: "420px" } }, `${w.artist} — ${w.album}`), h("div", { class: "muted xs ellip", style: { maxWidth: "420px" } }, w.note || (w.grabbed_username ? `from ${w.grabbed_username}` : ""), d ? ` · ${d.succeeded}/${d.total} files${d.errored ? ` · ${d.errored} failed` : ""}` : "")),
         h("td", {}, h("span", { class: "badge dim" }, w.source.replace(/^playlist:/, "pl:").slice(0, 26))),
         h("td", { class: "num" }, w.track_count || ""), h("td", { class: "num", title: `${w.search_misses || 0} search misses` }, w.attempts, w.search_misses ? h("span", { class: "dim2" }, `/${w.search_misses}`) : null),

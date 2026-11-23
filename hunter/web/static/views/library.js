@@ -1,53 +1,49 @@
-import { api, h, mount, fmt, toast, action, busy, sel, setQuery, setCrumbs, navigate, link, cover, artUrl, libArtUrl, qs, confirm, refreshStatusSoon, setTopActions, promptText, ls, can, safeDecode, store } from "../app.js";
-import { openAlbum, openTrack, qualityBadge, covBar, wantBadge, modifyDialog, openJob, openMbArtist, removeDialog, blockButton, openRemoval } from "./_shared.js";
+import { api, h, mount, fmt, toast, action, busy, sel, setQuery, setCrumbs, navigate, link, cover, artUrl, qs, confirm, refreshStatusSoon, setTopActions, promptText, ls, can, safeDecode, store } from "../app.js";
+import { openAlbum, openTrack, qualityBadge, covBar, wantBadge, modifyDialog, openJob, openMbArtist, removeDialog, blockButton, openRemoval, queueDownload, createTabs, statCard, debouncedInput, confirmBeetsRun, coverArtUrl } from "./_shared.js";
 import { libraryArtists, followedRoster } from "./artists.js";
-import { facetBar, facetParams, groupView, applyGroupPick, selectAllButton, queueDownload } from "./_filters.js";
+import { facetBar, facetParams, groupView, applyGroupPick, selectAllButton } from "./_filters.js";
 
 export default {
   async render(root, r) {
-    if (r.path[0] === "album" && r.path[1]) { openAlbum(+r.path[1]); r.path = []; }
+    if (r.path[0] === "album" && r.path[1]) {
+      const aid = +r.path[1];
+      r.path = [];
+      history.replaceState(history.state, "", "#/library");
+      openAlbum(aid);
+    }
     if (r.path[0] === "artist" && r.path[1]) return artistShelf(root, r.path[1]);
     const defs = [["overview", "Overview"], ["artists", "Artists"], ["albums", "Albums"], ["tracks", "Tracks"], ["genres", "Genres"], ["duplicates", "Duplicates"], ["junk", "Junk"], ["health", "Health"], ["removed", "Removed"]];
-    let tab = defs.some(([k]) => k === r.q.tab) ? r.q.tab : "overview";
-    const tabs = h("div", { class: "tabs" });
-    const out = h("div", {});
-    let tabGen = 0;
-    const go = () => {
-      const myGen = ++tabGen;
-      const alive = () => myGen === tabGen && out.isConnected;
-      return ({
-        overview: () => overview(alive),
-        artists: () => artistsTab(out, r, alive),
-        albums: () => albumsView(out, r, alive),
-        tracks: () => tracksView(out, r, alive),
-        genres: () => genres(alive),
-        duplicates: () => duplicatesView(out, r, alive),
-        junk: () => junkView(out, r, alive),
-        health: () => health(alive),
-        removed: () => removed(alive),
-      })[tab]();
-    };
-    const paintTabs = () => mount(tabs, ...defs.map(([k, l]) => h("button", { class: k === tab ? "active" : "", onClick: () => { tab = k; setQuery({ tab }); paintTabs(); go(); } }, l)));
+    const tabCtl = createTabs(defs, r.q.tab || "overview", (tab, { alive, out }) => ({
+      overview: () => overview(out, alive),
+      artists: () => artistsTab(out, r, alive),
+      albums: () => albumsView(out, r, alive),
+      tracks: () => tracksView(out, r, alive),
+      genres: () => genres(out, alive),
+      duplicates: () => duplicatesView(out, r, alive),
+      junk: () => junkView(out, r, alive),
+      health: () => health(out, alive),
+      removed: () => removed(out, alive),
+    })[tab]());
     if (can("operator")) setTopActions(h("a", { class: "btn sm", href: "#/beets?tab=console" }, "Console"));
-    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Library"), h("div", { class: "sub" }, "beets is the source of truth. Browse it, fix it, complete it — every action is a beet job you can watch."))), tabs, out);
-    paintTabs();
+    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Library"), h("div", { class: "sub" }, "beets is the source of truth. Browse it, fix it, complete it — every action is a beet job you can watch."))), tabCtl.el, tabCtl.out);
 
-    async function overview(alive) {
+    async function overview(out, alive) {
       mount(out, h("div", { class: "skel" }, h("div"), h("div"), h("div")));
-      const [o, fr] = await Promise.all([api("/api/library/overview"), api("/api/artists").catch(() => ({ artists: [] }))]);
+      let o, fr;
+      try { [o, fr] = await Promise.all([api("/api/library/overview"), api("/api/artists").catch(() => ({ artists: [] }))]); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
       if (!alive()) return;
       const following = (fr.artists || []).length;
       const max = Math.max(1, ...o.timeline.map(d => d.count));
       const fmtBar = (rows, key) => { const top = Math.max(1, ...rows.map(x => x.count)); return h("div", { class: "bars" }, ...rows.map(x => h("div", { class: "bar" }, h("span", { class: "lbl" }, x[key]), h("div", { class: "progress info" }, h("div", { style: { width: (100 * x.count / top) + "%" } })), h("span", { class: "n" }, fmt.num(x.count))))); };
       mount(out,
         h("div", { class: "stats mb" },
-          stat("Tracks", fmt.num(o.items), `${fmt.hours(o.hours)} · ~${fmt.bytes(o.est_bytes)}`, "#/library?tab=tracks"),
-          stat("Albums", fmt.num(o.albums), `${fmt.num(o.artists)} artists`, "#/library?tab=artists"),
-          stat("Following", fmt.num(following), following === 1 ? "artist watched for new releases" : "artists watched for new releases", "#/library?tab=artists&view=following"),
-          stat("Lossless", o.lossless_pct + "%", `${fmt.num(o.lossless)} tracks`, "#/library?tab=albums&filter=lossy"),
-          stat("Added", "+" + fmt.num(o.added["7d"]), `this week · +${o.added["24h"]} today · +${fmt.num(o.added["30d"])} this month`, "#/library?tab=albums&filter=recent&sort=added"),
-          stat("Incomplete", fmt.num(o.incomplete_albums), "albums missing tracks", "#/library?tab=albums&filter=incomplete&sort=coverage", o.incomplete_albums ? "warn" : ""),
-          stat("No art", fmt.num(o.no_art_albums), "albums without cover", "#/library?tab=albums&filter=noart", o.no_art_albums ? "warn" : "")),
+          statCard("Tracks", fmt.num(o.items), `${fmt.hours(o.hours)} · ~${fmt.bytes(o.est_bytes)}`, "#/library?tab=tracks"),
+          statCard("Albums", fmt.num(o.albums), `${fmt.num(o.artists)} artists`, "#/library?tab=artists"),
+          statCard("Following", fmt.num(following), following === 1 ? "artist watched for new releases" : "artists watched for new releases", "#/library?tab=artists&view=following"),
+          statCard("Lossless", o.lossless_pct + "%", `${fmt.num(o.lossless)} tracks`, "#/library?tab=albums&filter=lossy"),
+          statCard("Added", "+" + fmt.num(o.added["7d"]), `this week · +${o.added["24h"]} today · +${fmt.num(o.added["30d"])} this month`, "#/library?tab=albums&filter=recent&sort=added"),
+          statCard("Incomplete", fmt.num(o.incomplete_albums), "albums missing tracks", "#/library?tab=albums&filter=incomplete&sort=coverage", o.incomplete_albums ? "warn" : ""),
+          statCard("No art", fmt.num(o.no_art_albums), "albums without cover", "#/library?tab=albums&filter=noart", o.no_art_albums ? "warn" : "")),
         h("div", { class: "grid c2 mb" },
           h("div", { class: "card" }, h("h3", {}, "Additions · 30 days"), h("div", { class: "sparkline" }, ...o.timeline.map(d => h("div", { class: d.count ? "" : "zero", title: `${d.day}: ${d.count}`, style: { height: (100 * d.count / max) + "%" } })))),
           h("div", { class: "card" }, h("h3", {}, "Formats"), fmtBar(o.formats, "format"))),
@@ -58,21 +54,21 @@ export default {
         h("div", { class: "grid covers" }, ...o.recent.map(a => albumCard({ ...a, has_art: 1 }))));
     }
 
-    async function genres(alive) {
+    async function genres(out, alive) {
       mount(out, h("div", { class: "skel" }, h("div"), h("div")));
-      const g = await api("/api/library/genres?limit=400");
+      let g; try { g = await api("/api/library/genres?limit=400"); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
       if (!alive()) return;
       const gList = g.genres || [], tList = g.types || [];
       const max = Math.max(1, ...gList.map(x => x.items));
       const tMax = Math.max(1, tList[0]?.count || 1);
       mount(out, h("div", { class: "row mb" }, h("span", { class: "muted small" }, `${gList.length} genres`), can("operator") ? h("a", { class: "btn xs ml-auto", href: "#/beets?tab=scripts" }, "Normalize genres (script)") : null),
         h("div", { class: "grid c2" }, h("div", { class: "card" }, h("h3", {}, "Genres"), gList.length ? h("div", { class: "bars" }, ...gList.map(x => h("div", { class: "bar" }, h("a", { class: "lbl", href: link("library", { tab: "albums", genre: x.genre }) }, x.genre), h("div", { class: "progress info" }, h("div", { style: { width: (100 * x.items / max) + "%" } })), h("span", { class: "n" }, `${fmt.num(x.albums)} / ${fmt.num(x.items)}`)))) : h("div", { class: "empty small" }, "No genres yet.")),
-          h("div", { class: "card" }, h("h3", {}, "Album types"), tList.length ? h("div", { class: "bars" }, ...tList.map(x => h("div", { class: "bar" }, h("a", { class: "lbl", href: link("library", { tab: "albums", type: x.type }) }, x.type || "(none)"), h("div", { class: "progress info" }, h("div", { style: { width: (100 * x.count / tMax) + "%" } })), h("span", { class: "n" }, fmt.num(x.count))))) : h("div", { class: "empty small" }, "No albums yet."))));
+          h("div", { class: "card" }, h("h3", {}, "Album types"), tList.length ? h("div", { class: "bars" }, ...tList.map(x => h("div", { class: "bar" }, h("a", { class: "lbl", href: link("library", { tab: "albums", type: x.type || "__none__" }) }, x.type || "(none)"), h("div", { class: "progress info" }, h("div", { style: { width: (100 * x.count / tMax) + "%" } })), h("span", { class: "n" }, fmt.num(x.count))))) : h("div", { class: "empty small" }, "No albums yet."))));
     }
 
-    async function removed(alive) {
+    async function removed(out, alive) {
       mount(out, h("div", { class: "skel" }, h("div"), h("div")));
-      const r = await api("/api/library/removals");
+      let r; try { r = await api("/api/library/removals"); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
       if (!alive()) return;
       mount(out, h("div", { class: "hint mb" }, "Every removal made from hunter lands here as a run under ", store.status?.quarantine_dir ? h("code", { class: "mono" }, store.status.quarantine_dir + "/library_prune/") : "the quarantine library_prune directory", " with a manifest of files, rows and attributes. Undo puts everything back exactly; files are never deleted by hunter — reclaim space by hand once you are sure."),
         r.removals.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", {}, h("tr", {}, h("th", {}, "When"), h("th", {}, "Artists"), h("th", { class: "num" }, "Tracks"), h("th", { class: "num" }, "Albums"), h("th", { class: "num" }, "Size"), h("th", {}, "By"), h("th", {}, "State"), h("th", {}))),
@@ -81,9 +77,9 @@ export default {
         : h("div", { class: "empty" }, h("div", { class: "big" }, "✓"), "No removals yet. Remove an artist from its shelf, an album from its page, or a selection of tracks."));
     }
 
-    async function health(alive) {
+    async function health(out, alive) {
       mount(out, h("div", { class: "skel" }, h("div"), h("div")));
-      const o = await api("/api/library/overview");
+      let o; try { o = await api("/api/library/overview"); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
       if (!alive()) return;
       const op = can("operator");
       const card = (title, n, blurb, href, actions) => h("div", { class: "card" + (n ? " warn" : "") }, h("h3", {}, title, h("span", { class: "right" }, fmt.num(n))), h("div", { class: "hint mb" }, blurb), h("div", { class: "row" }, h("a", { class: "btn sm", href }, "Browse"), ...(op && actions ? actions : [])));
@@ -97,39 +93,23 @@ export default {
         card("Single-track albums", null, "Usually orphan rows or singletons that slipped past the no-singletons rule.", "#/library?tab=albums&filter=onetrack", [script("cleanup_lonetrack_comps", "Clean lone-track comps (dry)")]),
         card("Mixed-quality albums", null, "Lossless and lossy tracks in one album — dedup_masters collapses duplicate masters.", "#/library?tab=albums&filter=mixed", [script("dedup_masters", "Dry-run dedup")])));
     }
-    go();
+    tabCtl.go();
   },
 };
-
-export function stat(k, v, d, href, cls = "") { return h("a", { class: "stat " + cls, href }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "d" }, d)); }
 
 export function albumCard(a) {
   const w = a.wants || {};
   return h("div", { class: "cover-card", onClick: () => openAlbum(a.id) },
-    cover(a.has_art ? libArtUrl(a.id) : (a.rgid ? artUrl(a.rgid) : ""), { size: "xxl" }),
+    cover(coverArtUrl(a), { size: "xxl" }),
     h("div", { class: "t", title: a.album }, a.album), h("div", { class: "s" }, a.artist, a.year ? ` · ${a.year}` : ""),
     h("div", { class: "m" }, a.tracktotal && a.tracks < a.tracktotal ? h("span", { class: "badge warn" }, `${a.tracks}/${a.tracktotal}`) : null, a.lossless_share !== undefined ? qualityBadge(a) : null, w.gapfill ? wantBadge(w.gapfill) : null, w.upgrade ? wantBadge(w.upgrade) : null));
 }
 
-async function runBeetWithConfirm(body, label) {
-  let res;
-  try {
-    res = await api("/api/beets/run", body);
-  } catch (e) {
-    if (e.status === 409 && e.data?.needs_confirm) {
-      const n = e.data.count;
-      if (!(await confirm({ title: `${label}: ${fmt.num(n)} rows?`, body: `This will touch ${fmt.num(n)} rows in beets. Confirm to run.`, ok: "Run", danger: true, typed: n > 50 ? String(n) : "" }))) return null;
-      res = await api("/api/beets/run", { ...body, confirm_count: n });
-    } else throw e;
-  }
-  return res;
-}
-
 export async function albumsView(out, r, alive = () => out.isConnected) {
-  const st = { q: r.q.q || "", sort: r.q.sort || "added", filter: r.q.filter || "", genre: r.q.genre || "", decade: r.q.decade || "", type: r.q.type || "", fmt: r.q.fmt || "", added: r.q.added || "", artist: r.q.artist || "", year: r.q.year || "", group: r.q.group || "", letter: r.q.letter || "" };
-  let view = ls.get("lib_view", "grid"), offset = 0, rows = [], total = 0;
+  const st = { q: r.q.q || "", sort: r.q.sort || "added", filter: r.q.filter || "", genre: r.q.genre || "", decade: r.q.decade || "", type: r.q.type || "", fmt: r.q.fmt || "", added: r.q.added || "", artist: r.q.artist || "", year: r.q.year || "", label: r.q.label || "", group: r.q.group || "", letter: r.q.letter || "" };
+  let view = ls.get("lib_view", "grid"), offset = 0, rows = [], total = 0, loadGen = 0;
   const list = h("div", {});
-  const beetSel = (act, label) => ({ label, role: "operator", onClick: async (items) => { const res = await runBeetWithConfirm({ command: act, query: items.map(a => `album_id:${a.id}`).join(" , "), apply: true, confirm_count: items.length }, label); if (!res) return; if (res.ok) { toast(`${act} started on ${items.length} albums`, "ok"); openJob(res.job.id); } else toast(res.error, "bad"); } });
+  const beetSel = (act, label) => ({ label, role: "operator", onClick: async (items) => { const res = await confirmBeetsRun({ command: act, query: items.map(a => `album_id:${a.id}`).join(" , "), apply: true, confirm_count: items.length }, label); if (!res) return; if (res.ok) { toast(`${act} started on ${items.length} albums`, "ok"); openJob(res.job.id); } else toast(res.error, "bad"); } });
   sel.configure("albums", [
     { label: "Download", onClick: async (items) => { await queueDownload({ title: items.length === 1 ? `${items[0].artist} — ${items[0].album}` : `${items.length} albums`, album_ids: items.map(a => a.id) }); sel.clear(); } },
     { label: "Complete", role: "operator", onClick: async (items) => { let n = 0; for (const a of items) { const r = await api("/api/library/want", { album_id: a.id, kind: "gapfill" }); n += r.added ? 1 : 0; } toast(`${n} gap-fill wants`, "ok"); sel.clear(); refreshStatusSoon(); load(); } },
@@ -148,11 +128,14 @@ export async function albumsView(out, r, alive = () => out.isConnected) {
   const ctx = h("div", { class: "row between mb" });
   mount(out, bar.el, ctx, list);
   async function load(more = false) {
+    const myGen = ++loadGen;
     bar.paintActive();
     if (st.group) { mount(ctx); await groupView(list, { base: "/api/library/albums", state: st, unit: "albums", onPick: (k) => { if (k !== null) applyGroupPick(st, k); bar.rebuild(); load(); } }); return; }
-    offset = more ? offset + 60 : 0;
-    const res = await api(`/api/library/albums${qs({ ...facetParams(st), offset })}`);
-    if (!alive()) return;
+    const nextOffset = more ? offset + 60 : 0;
+    let res;
+    try { res = await api(`/api/library/albums${qs({ ...facetParams(st), offset: nextOffset })}`); } catch (e) { if (myGen === loadGen && alive()) mount(list, h("div", { class: "notice bad" }, e.message)); return; }
+    if (myGen !== loadGen || !alive()) return;
+    offset = nextOffset;
     rows = more ? rows.concat(res.albums) : res.albums; total = res.total; paint();
   }
   function paint() {
@@ -165,7 +148,7 @@ export async function albumsView(out, r, alive = () => out.isConnected) {
     if (view === "grid") { mount(list, h("div", { class: "grid covers" }, ...rows.map(a => { const c = albumCard(a); const chk = h("span", { class: "check" + (sel.has(a.id) ? " on" : ""), style: { position: "absolute", top: "6px", left: "6px", background: "rgba(0,0,0,.5)" }, onClick: (e) => { e.stopPropagation(); chk.classList.toggle("on", sel.toggle(a.id, a)); } }, "✓"); c.style.position = "relative"; c.prepend(chk); return c; })), more); return; }
     mount(list, h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", {}, h("tr", {}, h("th", {}), h("th", {}, ""), h("th", {}, "Album"), h("th", {}, "Artist"), h("th", { class: "num" }, "Year"), h("th", {}, "Tracks"), h("th", {}, "Quality"), h("th", {}, "Genre"), h("th", {}, "Added"), h("th", {}))),
       h("tbody", {}, ...rows.map(a => { const chk = h("span", { class: "check" + (sel.has(a.id) ? " on" : ""), onClick: (e) => { e.stopPropagation(); chk.classList.toggle("on", sel.toggle(a.id, a)); } }, "✓");
-        return h("tr", { class: "click", onClick: () => openAlbum(a.id) }, h("td", {}, chk), h("td", {}, cover(a.has_art ? libArtUrl(a.id) : (a.rgid ? artUrl(a.rgid) : ""), {})), h("td", { class: "b" }, a.album, a.albumtype && a.albumtype !== "album" ? h("span", { class: "badge dim", style: { marginLeft: "6px" } }, a.albumtype) : null),
+        return h("tr", { class: "click", onClick: () => openAlbum(a.id) }, h("td", {}, chk), h("td", {}, cover(coverArtUrl(a), {})), h("td", { class: "b" }, a.album, a.albumtype && a.albumtype !== "album" ? h("span", { class: "badge dim", style: { marginLeft: "6px" } }, a.albumtype) : null),
           h("td", { class: "muted" }, h("a", { href: link("library", {}, "artist", a.artist), onClick: (e) => e.stopPropagation() }, a.artist)), h("td", { class: "num" }, a.year || ""), h("td", {}, covBar(a.tracks, a.tracktotal)), h("td", {}, qualityBadge(a)),
           h("td", { class: "muted small" }, a.genre ? h("a", { href: link("library", { tab: "albums", genre: a.genre }), onClick: (e) => e.stopPropagation() }, a.genre) : ""), h("td", { class: "muted small nowrap" }, fmt.ago(a.added_ts)),
           h("td", {}, h("div", { class: "actions" }, h("button", { class: "btn xs", title: "download album as zip", onClick: action(null, async (e) => { e.stopPropagation(); await queueDownload({ title: `${a.artist} — ${a.album}`, album_ids: [a.id] }); }) }, "⤓")))); })))), more);
@@ -175,13 +158,13 @@ export async function albumsView(out, r, alive = () => out.isConnected) {
 
 // ---------------- tracks ----------------
 async function tracksView(out, r, alive = () => out.isConnected) {
-  const st = { q: r.q.q || "", fmt: r.q.fmt || "", sort: r.q.sort || "added", filter: r.q.filter || "", genre: r.q.genre || "", decade: r.q.decade || "", added: r.q.added || "", artist: r.q.artist || "", year: r.q.year || "", group: r.q.group || "" };
-  let offset = 0, rows = [], total = 0;
+  const st = { q: r.q.q || "", fmt: r.q.fmt || "", sort: r.q.sort || "added", filter: r.q.filter || "", genre: r.q.genre || "", decade: r.q.decade || "", added: r.q.added || "", artist: r.q.artist || "", year: r.q.year || "", min_kbps: r.q.min_kbps || "", max_kbps: r.q.max_kbps || "", group: r.q.group || "" };
+  let offset = 0, rows = [], total = 0, loadGen = 0;
   const list = h("div", {});
   sel.configure("tracks", [
     { label: "Download", onClick: async (items) => { await queueDownload({ title: items.length === 1 ? `${items[0].artist} - ${items[0].title}` : `${items.length} tracks`, item_ids: items.map(t => t.id) }); sel.clear(); } },
     { label: "Edit tags…", role: "operator", onClick: async (items) => modifyDialog({ itemIds: items.map(t => t.id), after: load }) },
-    { label: "Write tags", role: "operator", onClick: async (items) => { const res = await runBeetWithConfirm({ command: "write", query: items.map(t => `id:${t.id}`).join(" , "), apply: true, confirm_count: items.length }, "Write tags"); if (!res) return; if (res.ok) openJob(res.job.id); else toast(res.error, "bad"); } },
+    { label: "Write tags", role: "operator", onClick: async (items) => { const res = await confirmBeetsRun({ command: "write", query: items.map(t => `id:${t.id}`).join(" , "), apply: true, confirm_count: items.length }, "Write tags"); if (!res) return; if (res.ok) openJob(res.job.id); else toast(res.error, "bad"); } },
     { label: "→ Navidrome playlist", role: "operator", onClick: async (items) => { const name = await promptText({ title: "Navidrome playlist name", value: "hunter picks" }); if (!name) return; const res = await api("/api/make_playlist", { name, tracks: items.map(t => ({ title: t.title, artist: t.artist })) }); toast(`${res.matched}/${res.total} matched → “${res.name || name}”`, "ok"); sel.clear(); } },
     { label: "Remove…", cls: "danger", role: "operator", onClick: (items) => removeDialog({ itemIds: items.map(t => t.id), title: `${items.length} selected tracks`, after: () => { sel.clear(); load(); } }) },
   ]);
@@ -195,19 +178,22 @@ async function tracksView(out, r, alive = () => out.isConnected) {
   const ctx = h("div", { class: "row between mb" });
   mount(out, bar.el, ctx, list);
   async function load(more = false) {
+    const myGen = ++loadGen;
     bar.paintActive();
     if (st.group) { mount(ctx); await groupView(list, { base: "/api/library/tracks", state: st, unit: "tracks", onPick: (k) => { if (k !== null) applyGroupPick(st, k); bar.rebuild(); load(); } }); return; }
-    offset = more ? offset + 100 : 0;
-    const res = await api(`/api/library/tracks${qs({ ...facetParams(st), offset })}`);
-    if (!alive()) return;
+    const nextOffset = more ? offset + 100 : 0;
+    let res;
+    try { res = await api(`/api/library/tracks${qs({ ...facetParams(st), offset: nextOffset })}`); } catch (e) { if (myGen === loadGen && alive()) mount(list, h("div", { class: "notice bad" }, e.message)); return; }
+    if (myGen !== loadGen || !alive()) return;
+    offset = nextOffset;
     rows = more ? rows.concat(res.tracks) : res.tracks; total = res.total;
     mount(ctx, h("span", { class: "muted small" }, `${fmt.num(rows.length)} of ${fmt.num(total)} tracks`), h("span", { class: "ml-auto" }),
-      rows.length ? h("button", { class: "btn xs ghost", onClick: () => { rows.forEach(t => sel.set(t.id, t, true)); list.querySelectorAll(".check").forEach(c => c.classList.add("on")); } }, "Select page") : null,
+      rows.length ? h("button", { class: "btn xs ghost", onClick: () => { rows.forEach(t => sel.set(t.id, t, true)); list.querySelectorAll(".check:not([data-local])").forEach(c => c.classList.add("on")); } }, "Select page") : null,
       selectAllButton({ total, url: `/api/library/tracks/ids${qs(facetParams(st))}`, key: "tracks", map: (t) => ({ key: t.id, item: t }) }));
     mount(list, h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", {}, h("tr", {}, h("th", {}), h("th", {}, "Title"), h("th", {}, "Artist"), h("th", {}, "Album"), h("th", { class: "num" }, "Year"), h("th", {}, "Format"), h("th", { class: "num" }, "kbps"), h("th", { class: "num" }, "Time"), h("th", {}, "Genre"), h("th", {}))),
       h("tbody", {}, ...rows.map(t => { const chk = h("span", { class: "check" + (sel.has(t.id) ? " on" : ""), onClick: (e) => { e.stopPropagation(); chk.classList.toggle("on", sel.toggle(t.id, t)); } }, "✓");
         return h("tr", { class: "click", onClick: () => openTrack(t.id) }, h("td", {}, chk), h("td", { class: "b" }, t.title || h("span", { class: "muted" }, "(untitled)")), h("td", { class: "muted" }, t.artist), h("td", {}, h("a", { href: "#", onClick: (e) => { e.preventDefault(); e.stopPropagation(); openAlbum(t.album_id); } }, t.album)), h("td", { class: "num" }, t.year || ""),
-          h("td", {}, h("span", { class: "badge " + (["FLAC", "ALAC", "APE", "WAV", "AIFF", "WV", "DSF"].includes((t.format || "").toUpperCase()) ? "ok" : "dim") }, (t.format || "?").toLowerCase(), t.bitdepth > 16 ? ` ${t.bitdepth}b` : "")), h("td", { class: "num" }, t.kbps || ""), h("td", { class: "num" }, fmt.mmss(t.secs)),
+          h("td", {}, h("span", { class: "badge " + (t.lossless ? "ok" : "dim") }, (t.format || "?").toLowerCase(), t.bitdepth > 16 ? ` ${t.bitdepth}b` : "")), h("td", { class: "num" }, t.kbps || ""), h("td", { class: "num" }, fmt.mmss(t.secs)),
           h("td", { class: "muted small" }, t.genre || ""), h("td", {}, h("div", { class: "actions" }, h("a", { class: "btn xs", href: `/api/dl/track?id=${encodeURIComponent(t.id)}`, download: "", title: "download this file", onClick: (e) => e.stopPropagation() }, "⤓")))); })))),
       rows.length < total ? h("button", { class: "btn mt", onClick: (e) => busy(e.currentTarget, load(true)) }, `Load more (${fmt.num(total - rows.length)} left)`) : null,
       !rows.length ? h("div", { class: "empty" }, "No tracks match.") : null);
@@ -218,12 +204,11 @@ async function tracksView(out, r, alive = () => out.isConnected) {
 // ---------------- duplicates ----------------
 async function duplicatesView(out, r, alive = () => out.isConnected) {
   const st = { q: r.q.q || "", scope: r.q.scope || "all", sort: r.q.sort || "waste" };
-  let offset = 0, groups = [], total = 0, extra = 0;
+  let offset = 0, groups = [], total = 0, extra = 0, loadGen = 0;
   const keep = new Map();      // group key → item id to keep
   const include = new Set();   // group keys whose non-kept copies are queued for removal
   const list = h("div", {}); const ctx = h("div", { class: "row between mb" });
-  const input = h("input", { class: "input", type: "search", placeholder: "artist / title / album", value: st.q });
-  let timer; input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => { st.q = input.value.trim(); setQuery({ q: st.q }); load(); }, 320); });
+  const input = debouncedInput({ placeholder: "artist / title / album", value: st.q, delay: 320, onInput: (v) => { st.q = v; setQuery({ q: st.q }); load(); } });
   const scopeSel = h("select", { class: "select sm", onChange: (e) => { st.scope = e.target.value; setQuery({ scope: st.scope }); load(); } }, ...[["all", "Everywhere"], ["same_album", "Within one album (true dupes)"], ["cross_album", "Across albums (comps, reissues)"]].map(([v, l]) => h("option", { value: v, selected: st.scope === v }, l)));
   const sortSel = h("select", { class: "select sm", onChange: (e) => { st.sort = e.target.value; setQuery({ sort: st.sort }); load(); } }, ...[["waste", "Most wasted space"], ["count", "Most copies"], ["artist", "Artist"]].map(([v, l]) => h("option", { value: v, selected: st.sort === v }, l)));
   const pending = () => { const ids = []; for (const g of groups) if (include.has(g.key)) for (const t of g.tracks) if (t.id !== keep.get(g.key)) ids.push(t.id); return ids; };
@@ -235,10 +220,17 @@ async function duplicatesView(out, r, alive = () => out.isConnected) {
     h("div", { class: "filterbar" }, input, scopeSel, sortSel), ctx, bulk, list);
   const q = (t) => `${t.format ? t.format.toLowerCase() : "?"}${t.bitdepth > 16 ? ` ${t.bitdepth}b` : ""}${t.samplerate > 48000 ? ` ${(t.samplerate / 1000).toFixed(1)}k` : ""}${!t.lossless && t.kbps ? ` ${t.kbps} kbps` : ""}`;
   async function load(more = false) {
-    offset = more ? offset + 40 : 0;
-    const res = await api(`/api/library/duplicates${qs({ q: st.q, scope: st.scope, sort: st.sort, offset, limit: 40 })}`);
-    if (!alive()) return;
+    const myGen = ++loadGen;
+    const nextOffset = more ? offset + 40 : 0;
+    let res;
+    try { res = await api(`/api/library/duplicates${qs({ q: st.q, scope: st.scope, sort: st.sort, offset: nextOffset, limit: 40 })}`); } catch (e) { if (myGen === loadGen && alive()) mount(list, h("div", { class: "notice bad" }, e.message)); return; }
+    if (myGen !== loadGen || !alive()) return;
+    offset = nextOffset;
     groups = more ? groups.concat(res.groups) : res.groups; total = res.total; extra = res.extra_tracks;
+    if (!more) {
+      const keys = new Set(groups.map(g => g.key));
+      for (const k of [...include]) if (!keys.has(k)) include.delete(k);
+    }
     for (const g of groups) if (!keep.has(g.key)) keep.set(g.key, g.suggest_keep);
     paint();
   }
@@ -246,7 +238,7 @@ async function duplicatesView(out, r, alive = () => out.isConnected) {
     mount(ctx, h("span", { class: "muted small" }, `${fmt.num(groups.length)} of ${fmt.num(total)} groups · ${fmt.num(extra)} surplus copies in this scope`));
     paintBulk();
     mount(list, ...groups.map(g => {
-      const mark = h("span", { class: "check" + (include.has(g.key) ? " on" : ""), title: "mark this group for cleanup", onClick: () => { include.has(g.key) ? include.delete(g.key) : include.add(g.key); mark.classList.toggle("on", include.has(g.key)); paintBulk(); } }, "✓");
+      const mark = h("span", { class: "check" + (include.has(g.key) ? " on" : ""), dataset: { local: "1" }, title: "mark this group for cleanup", onClick: () => { include.has(g.key) ? include.delete(g.key) : include.add(g.key); mark.classList.toggle("on", include.has(g.key)); paintBulk(); } }, "✓");
       return h("div", { class: "card tight mb dup-group" },
         h("div", { class: "row" }, mark, h("div", { class: "b ellip", style: { flex: 1 } }, `${g.tracks[0]?.artist || ""} — ${g.tracks[0]?.title || ""}`), h("span", { class: "badge " + (g.by === "mbid" ? "ok" : "dim"), title: g.by === "mbid" ? "matched by MusicBrainz recording id" : "matched by tags" }, g.by), h("span", { class: "badge acc" }, `${g.count} copies`), h("span", { class: "muted xs" }, `~${fmt.bytes(g.waste_bytes)} surplus`)),
         h("div", { class: "list" }, ...g.tracks.map(t => { const isKeep = keep.get(g.key) === t.id;
@@ -263,7 +255,7 @@ async function duplicatesView(out, r, alive = () => out.isConnected) {
 // ---------------- junk ----------------
 async function junkView(out, r, alive = () => out.isConnected) {
   mount(out, h("div", { class: "skel" }, h("div"), h("div"), h("div")));
-  const j = await api("/api/library/junk");
+  let j; try { j = await api("/api/library/junk"); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
   if (!alive()) return;
   const op = can("operator");
   const script = (id, label, apply = false) => h("button", { class: "btn xs", onClick: action(null, async (e) => { e.stopPropagation(); const r = await api("/api/beets/scripts/run", { id, apply }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, label);
@@ -310,7 +302,7 @@ async function artistsTab(out, r, alive = () => out.isConnected) {
   const seg = h("div", { class: "seg mb" });
   const body = h("div", {});
   const paint = () => mount(seg, ...[["all", "All artists"], ["following", "Following"]].map(([k, l]) => h("button", { class: k === view ? "active" : "", onClick: () => { view = k; setQuery({ view }); paint(); go(); } }, l)));
-  const go = () => (view === "following" ? followedRoster(body, 0, alive) : libraryArtists(body, r));
+  const go = () => (view === "following" ? followedRoster(body, 0, alive) : libraryArtists(body, r, alive));
   mount(out, h("div", { class: "row between mb" }, seg, h("span", { class: "hint" }, "Follow from an artist's shelf, Discover, or Spotify to watch for new releases.")), body);
   paint();
   await go();
@@ -329,10 +321,10 @@ async function artistShelf(root, name) {
   mount(root,
     h("div", { class: "page-head" }, h("div", {}, h("h1", {}, name), h("div", { class: "sub" }, `${owned} albums · ${fmt.num(a.tracks)} tracks · ${fmt.hours(a.hours)} · ${complete}/${owned} complete · ${lossless}/${owned} lossless`, a.genres.length ? ` · ${a.genres.slice(0, 4).join(", ")}` : "")),
       h("div", { class: "actions" },
-        a.followed ? h("span", { class: "badge ok" }, "followed") : (op ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/follow_by_name", { name }); toast(r.added ? `Following ${r.name}` : "Already following", "ok"); }) }, "Follow") : null),
+        a.followed ? h("span", { class: "badge ok" }, "followed") : (op ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/follow_by_name", { name }); toast(r.added ? `Following ${r.name}` : "Already following", "ok"); artistShelf(root, name); }) }, "Follow") : null),
         h("button", { class: "btn sm", onClick: () => a.mbid ? openMbArtist(a.mbid, name) : navigate(link("discover", { q: name, kind: "artist" })) }, "Discography (MB)"),
         op ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/library/beet", { action: "fetchart", artist: name }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, "Fetch missing art") : null,
-        op ? h("button", { class: "btn sm", onClick: () => modifyDialog({ query: artistQuery, album: true, current: { albumartist: name } }) }, "Rename artist…") : null,
+        op ? h("button", { class: "btn sm", onClick: () => modifyDialog({ query: artistQuery, album: true, current: { albumartist: name }, after: () => artistShelf(root, name) }) }, "Rename artist…") : null,
         op ? h("a", { class: "btn sm ghost", href: link("beets", { tab: "console", cmd: "list", query: artistQuery }) }, "Console") : null,
         h("button", { class: "btn sm", title: "every file by this artist as one zip", onClick: action(null, async () => { await queueDownload({ title: name, artists: [name] }); }) }, "Download all"),
         a.blocked ? h("span", { class: "badge bad", title: "future imports of this albumartist are quarantined" }, "blocked") : null,
@@ -340,13 +332,13 @@ async function artistShelf(root, name) {
         op ? h("button", { class: "btn sm danger", onClick: () => removeDialog({ artists: [name], title: name, after: () => { if (safeDecode(location.hash).includes(name)) navigate("#/library?tab=artists"); } }) }, "Remove artist…") : null)),
     h("div", { class: "spread" },
       h("div", { class: "table-wrap" }, h("table", { class: "table" }, h("thead", {}, h("tr", {}, h("th", {}), h("th", {}, "Album"), h("th", { class: "num" }, "Year"), h("th", {}, "Tracks"), h("th", {}, "Quality"), h("th", {}, "Type"), h("th", {}))),
-        h("tbody", {}, ...a.albums.map(x => h("tr", { class: "click", onClick: () => openAlbum(x.id) }, h("td", {}, cover(x.has_art ? libArtUrl(x.id) : (x.rgid ? artUrl(x.rgid) : ""), {})), h("td", { class: "b" }, x.album), h("td", { class: "num" }, x.year || ""), h("td", {}, covBar(x.tracks, x.tracktotal), x.wants?.gapfill ? wantBadge(x.wants.gapfill) : null), h("td", {}, qualityBadge(x), x.wants?.upgrade ? wantBadge(x.wants.upgrade) : null), h("td", { class: "muted small" }, x.albumtype || ""),
-          h("td", {}, h("div", { class: "actions" }, op && x.tracktotal && x.tracks < x.tracktotal && !x.wants?.gapfill ? h("button", { class: "btn xs primary", onClick: action(null, async (e) => { e.stopPropagation(); const r = await api("/api/library/want", { album_id: x.id, kind: "gapfill" }); toast(r.added ? "Hunting missing tracks" : "queued already", "ok"); refreshStatusSoon(); }) }, "Complete") : null))))))),
+        h("tbody", {}, ...a.albums.map(x => h("tr", { class: "click", onClick: () => openAlbum(x.id) }, h("td", {}, cover(coverArtUrl(x), {})), h("td", { class: "b" }, x.album), h("td", { class: "num" }, x.year || ""), h("td", {}, covBar(x.tracks, x.tracktotal), x.wants?.gapfill ? wantBadge(x.wants.gapfill) : null), h("td", {}, qualityBadge(x), x.wants?.upgrade ? wantBadge(x.wants.upgrade) : null), h("td", { class: "muted small" }, x.albumtype || ""),
+          h("td", {}, h("div", { class: "actions" }, op && x.tracktotal && x.tracks < x.tracktotal && !x.wants?.gapfill ? h("button", { class: "btn xs primary", onClick: action(null, async (e) => { e.stopPropagation(); const r = await api("/api/library/want", { album_id: x.id, kind: "gapfill" }); toast(r.added ? "Hunting missing tracks" : "queued already", "ok"); refreshStatusSoon(); artistShelf(root, name); }) }, "Complete") : null))))))),
       canonBox));
   try {
     const c = await api(`/api/canon?name=${encodeURIComponent(name)}${a.mbid ? "&mbid=" + encodeURIComponent(a.mbid) : ""}`);
     if (!root.isConnected) return;
     mount(canonBox, h("h3", {}, "Essential albums", h("span", { class: "right" }, c.total ? `${c.owned}/${c.total} owned` : c.note || "")),
-      c.canon.length ? h("div", { class: "list" }, ...c.canon.slice(0, 25).map(x => h("div", { class: "item click", onClick: () => x.album_id ? openAlbum(x.album_id) : null }, cover(artUrl(x.rgid), {}), h("div", { class: "main" }, h("div", { class: "t small" }, x.album), h("div", { class: "s" }, x.year || "", " · score ", (x.score * 100).toFixed(0))), h("div", { class: "end" }, x.owned ? h("span", { class: "badge ok" }, "owned") : x.want ? wantBadge(x.want) : (op ? h("button", { class: "btn xs primary", onClick: action(null, async (e) => { e.stopPropagation(); const r = await api("/api/request", { rgid: x.rgid, artist: name, album: x.album, year: x.year }); toast(r.added ? "Requested" : "owned / queued", r.added ? "ok" : "warn"); refreshStatusSoon(); }) }, "Request") : null))))) : h("div", { class: "empty small" }, "no data"));
+      c.canon.length ? h("div", { class: "list" }, ...c.canon.slice(0, 25).map(x => h("div", { class: "item click", onClick: () => x.album_id ? openAlbum(x.album_id) : null }, cover(artUrl(x.rgid), {}), h("div", { class: "main" }, h("div", { class: "t small" }, x.album), h("div", { class: "s" }, x.year || "", " · score ", (x.score * 100).toFixed(0))), h("div", { class: "end" }, x.owned ? h("span", { class: "badge ok" }, "owned") : x.want ? wantBadge(x.want) : (op ? h("button", { class: "btn xs primary", onClick: action(null, async (e) => { e.stopPropagation(); const r = await api("/api/request", { rgid: x.rgid, artist: name, album: x.album, year: x.year }); toast(r.added ? "Requested" : "owned / queued", r.added ? "ok" : "warn"); refreshStatusSoon(); artistShelf(root, name); }) }, "Request") : null))))) : h("div", { class: "empty small" }, "no data"));
   } catch (e) { if (root.isConnected) mount(canonBox, h("h3", {}, "Essential albums"), h("div", { class: "hint" }, e.message)); }
 }

@@ -1,31 +1,22 @@
-import { api, h, mount, fmt, toast, errToast, action, setQuery, poll, confirm, link, qs, setTopActions, store, modal, ls } from "../app.js";
-import { openJob, statusBadge, modeBadge, logView, setLog, field } from "./_shared.js";
+import { api, h, mount, fmt, toast, errToast, action, setQuery, poll, confirm, link, qs, setTopActions, store, modal, ls, route } from "../app.js";
+import { openJob, statusBadge, modeBadge, logView, setLog, field, createTabs, quoteArg, confirmBeetsRun } from "./_shared.js";
 
 export default {
   async render(root, r) {
     const defs = [["pipeline", "Pipeline"], ["console", "Console"], ["scripts", "Scripts"], ["quarantine", "Quarantine"], ["logs", "Logs"]];
-    let tab = defs.some(([k]) => k === r.q.tab) ? r.q.tab : "pipeline";
-    const tabs = h("div", { class: "tabs" });
-    const out = h("div", {});
-    let stopSubPoll = null, tabGen = 0;
-    const go = () => {
-      if (stopSubPoll) { stopSubPoll(); stopSubPoll = null; }
-      const myGen = ++tabGen;
-      return ({ pipeline, console: consoleView, scripts, quarantine, logs })[tab](myGen);
-    };
-    const paintTabs = () => mount(tabs, ...defs.map(([k, l]) => h("button", { class: k === tab ? "active" : "", onClick: () => { tab = k; setQuery({ tab }); paintTabs(); go(); } }, l)));
+    const tabCtl = createTabs(defs, r.q.tab || "pipeline", (tab, ctx) => ({ pipeline, console: consoleView, scripts, quarantine, logs })[tab](ctx));
+    const out = tabCtl.out;
     setTopActions(h("a", { class: "btn sm", href: "#/jobs" }, "Jobs"));
     const offlineBanner = !store.status?.console ? h("div", { class: "notice bad mb" }, h("div", { class: "body" }, h("b", {}, "Console offline. "), "The docker socket isn't mounted in this container. Mount /var/run/docker.sock (read-only) with Docker group access to enable the beets console.")) : null;
-    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Beets"), h("div", { class: "sub" }, "The import pipeline and the beets CLI, driven from here. Every command runs inside the beets container with a live log; mutations dry-run first."))), offlineBanner, tabs, out);
-    paintTabs();
+    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Beets"), h("div", { class: "sub" }, "The import pipeline and the beets CLI, driven from here. Every command runs inside the beets container with a live log; mutations dry-run first."))), offlineBanner, tabCtl.el, out);
 
     // ---------------- pipeline ----------------
-    async function pipeline(myGen) {
+    async function pipeline({ alive, setPoll }) {
       const box = h("div", {});
       mount(out, box);
       const paint = async () => {
         const p = await api("/api/beets/pipeline");
-        if (myGen !== tabGen || !out.isConnected) return;
+        if (!alive()) return;
         const w = p.watcher;
         const m = p.maintenance || {};
         const qt = p.quarantine || {};
@@ -33,7 +24,7 @@ export default {
         const watcherCard = h("div", { class: "card" + (w && !w.alive ? " bad" : "") }, h("h3", {}, h("span", { class: "dot " + (w?.alive ? "ok" : "bad") }), "Import watcher", h("span", { class: "right" }, w ? `log ${w.log_age_s !== null ? fmt.dur(w.log_age_s) + " ago" : "?"}` : "")),
           w ? h("div", { class: "stack" },
             h("div", { class: "row small" }, h("span", { class: "badge " + (w.alive ? "ok" : "bad") }, w.alive ? "alive" : "DOWN"), h("span", { class: "muted" }, `pids ${w.pids || "—"}`), h("span", { class: "muted" }, `last 500 lines: ${w.counts.queued} queued · ${w.counts.imported} imported · ${w.counts.quarantined} quarantined`)),
-            h("div", { class: "row" }, h("button", { class: "btn sm", onClick: action(null, async () => { if (await confirm({ title: "Bounce the watcher?", body: "pkill import_watcher — s6 respawns it in seconds. In-flight imports finish on the next pass.", ok: "Bounce" })) { const r = await api("/api/beets/watcher/restart", {}); toast(r.ok ? "Bounced" : r.error, r.ok ? "ok" : "bad"); } }) }, "Bounce watcher"), h("button", { class: "btn sm ghost", onClick: () => { tab = "logs"; setQuery({ tab, log: "beets-watcher" }); paintTabs(); go(); } }, "Watcher log"), h("button", { class: "btn sm ghost", onClick: showConfig }, "Config")),
+            h("div", { class: "row" }, h("button", { class: "btn sm", onClick: action(null, async () => { if (await confirm({ title: "Bounce the watcher?", body: "pkill import_watcher — s6 respawns it in seconds. In-flight imports finish on the next pass.", ok: "Bounce" })) { const r = await api("/api/beets/watcher/restart", {}); toast(r.ok ? "Bounced" : r.error, r.ok ? "ok" : "bad"); } }) }, "Bounce watcher"), h("button", { class: "btn sm ghost", onClick: () => tabCtl.switchTo("logs", { log: "beets-watcher" }) }, "Watcher log"), h("button", { class: "btn sm ghost", onClick: showConfig }, "Config")),
             h("div", { class: "timeline", style: { maxHeight: "300px", overflow: "auto" } }, ...(w.events || []).slice(0, 30).map(e => h("div", { class: "tl" }, h("span", { class: "ts" }, e.ts.slice(11)), h("span", { class: "badge " + ({ imported: "ok", quarantined: "bad", importing: "warn", queued: "info" }[e.kind] || (e.level === "ERROR" ? "bad" : "dim")) }, e.kind === "info" ? e.level.toLowerCase() : e.kind), h("span", { class: "what xs mono" }, e.msg)))))
           : h("div", { class: "hint" }, "console offline"));
         const srcCard = h("div", { class: "card" }, h("h3", {}, "Download sources", h("span", { class: "right" }, "what's waiting for import")),
@@ -42,8 +33,8 @@ export default {
         const maintCard = h("div", { class: "card" }, h("h3", {}, h("span", { class: "dot " + (running ? "warn pulse" : m.ok ? "ok" : "bad") }), "Maintenance", h("span", { class: "right" }, m.log_mtime ? fmt.ago(m.log_mtime) : "")),
           m.ok ? h("dl", { class: "kv small mb" }, ...Object.entries(m).filter(([k]) => !["ok", "lock_mtime", "log", "log_mtime"].includes(k)).slice(0, 12).map(([k, v]) => [h("dt", {}, k), h("dd", { class: "mono" }, typeof v === "object" ? JSON.stringify(v) : String(v))])) : h("div", { class: "hint mb" }, "no maintenance_last.json yet"),
           h("div", { class: "row" }, h("button", { class: "btn sm primary", onClick: action(null, async () => { if (await confirm({ title: "Run nightly maintenance now?", body: "Backup → duplicates report → bad → missing → orphan prune → move → write → rescans. Hours long, flock-guarded.", ok: "Run" })) { const r = await api("/api/beets/maintenance", {}); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); } }) }, running ? "Running…" : "Run now"),
-            h("button", { class: "btn sm", onClick: action(null, async (e) => { const r = await api("/api/beets/rescan", { app: "all" }); toast(r.ok ? "Rescans triggered" : r.error, r.ok ? "ok" : "bad"); }) }, "Sync media servers"),
-            m.log ? h("button", { class: "btn sm ghost", onClick: () => { tab = "logs"; setQuery({ tab, log: "beets-maintenance" }); paintTabs(); go(); } }, "Log") : null),
+            h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/beets/rescan", { app: "all" }); toast(r.ok ? "Rescans triggered" : r.error, r.ok ? "ok" : "bad"); }) }, "Sync media servers"),
+            m.log ? h("button", { class: "btn sm ghost", onClick: () => tabCtl.switchTo("logs", { log: "beets-maintenance" }) }, "Log") : null),
           h("div", { class: "section-title" }, "Reports"), p.reports.length ? h("div", { class: "chips" }, ...p.reports.slice(0, 12).map(rep => h("span", { class: "chip", onClick: () => showReport(rep.name) }, rep.name.replace(/_\d{8}_\d{6}/, ""), h("span", { class: "n" }, fmt.bytes(rep.size))))) : h("div", { class: "hint" }, "none"),
           ...(p.schedule && p.schedule.length > 0 ? [h("div", { class: "section-title" }, "Scheduled jobs"), h("table", { class: "mini-tbl" }, ...p.schedule.map(s => h("tr", {}, h("td", {}, s.time), h("td", {}, h("b", {}, s.job), h("div", { class: "muted xs" }, s.what)))))] : []));
         const qCard = h("div", { class: "card" }, h("h3", {}, "Quarantine", h("a", { class: "right", href: "#/beets?tab=quarantine" }, `${fmt.num(qt.total || 0)} entries →`)),
@@ -51,7 +42,7 @@ export default {
         const jobsCard = h("div", { class: "card" }, h("h3", {}, "Recent jobs", h("a", { class: "right", href: "#/jobs" }, "all →")), p.jobs.length ? h("div", { class: "list" }, ...p.jobs.map(j => h("div", { class: "item click", onClick: () => openJob(j.id) }, h("div", { class: "main" }, h("div", { class: "t small" }, j.title), h("div", { class: "s" }, fmt.ago(j.started_ts), " · ", fmt.dur(j.duration))), h("div", { class: "end" }, modeBadge(j.mode), statusBadge(j.status))))) : h("div", { class: "hint" }, "none yet"));
         mount(box, h("div", { class: "spread" }, h("div", { class: "stack", style: { gap: "12px" } }, watcherCard, srcCard), h("div", { class: "stack", style: { gap: "12px" } }, maintCard, qCard, jobsCard)));
       };
-      stopSubPoll = poll(paint, 15000);
+      setPoll(poll(paint, 15000));
     }
     async function showConfig() {
       const c = await api("/api/beets/config").catch(errToast); if (!c) return;
@@ -67,24 +58,39 @@ export default {
     }
 
     // ---------------- console ----------------
-    async function consoleView(myGen) {
+    async function consoleView({ alive }) {
+      const rq = route().q;
       const cat = await api("/api/beets/commands");
-      if (myGen !== tabGen || !out.isConnected) return;
+      if (!alive()) return;
       const cmds = cat.commands;
-      let cur = cmds.find(c => c.name === (r.q.cmd || "list")) || cmds[0];
+      let cur = cmds.find(c => c.name === (rq.cmd || "list")) || cmds[0];
       let lastPreview = null;
       const groups = [...new Set(cmds.map(c => c.group))];
       const picker = h("div", { class: "stack", style: { gap: "4px" } });
-      // phones: the command list lives in a select above the form instead of a card below it
       const pickSel = h("select", { class: "select mob-only mb", "aria-label": "beet command", onChange: () => { cur = cmds.find(c => c.name === pickSel.value) || cur; lastPreview = null; setQuery({ cmd: cur.name }); paintPicker(); paintForm(); } },
         ...groups.map(g => h("optgroup", { label: g }, ...cmds.filter(c => c.group === g).map(c => h("option", { value: c.name }, c.name + (c.cls === "blocked" ? " (blocked)" : c.cls === "mutate" ? " ✎" : ""))))));
       const form = h("div", { class: "stack" });
       const preview = h("div", {});
       const rawInp = h("textarea", { class: "input mono", rows: 2, placeholder: "beet modify -a albumartist:Foo year=1999   (free-form; flags validated against the allowlist)" });
       const rawMode = h("input", { type: "checkbox" });
-      const queryInp = h("input", { class: "input mono", placeholder: "beets query, e.g.  albumartist:Radiohead year:1997   or  album_id:123", value: r.q.query || "" });
+      const queryInp = h("input", { class: "input mono", placeholder: "beets query, e.g.  albumartist:Radiohead year:1997   or  album_id:123", value: rq.query || "" });
       const posInp = h("input", { class: "input mono", placeholder: "" });
-      rawInp.addEventListener("input", () => { lastPreview = null; });
+      const activeCmd = () => {
+        if (!rawMode.checked) return cur;
+        const first = rawInp.value.trim().replace(/^beet\s+/, "").split(/\s+/)[0] || "";
+        return cmds.find(c => c.name === first || (c.aliases || []).includes(first)) || cur;
+      };
+      const actionsRow = h("div", { class: "row mt" });
+      const paintActions = () => {
+        const eff = activeCmd();
+        if (eff.cls === "blocked") { mount(actionsRow); return; }
+        mount(actionsRow,
+          eff.quick ? h("button", { class: "btn", onClick: action(null, () => run({ quick: true })) }, "Run (inline)") : null,
+          h("button", { class: "btn", onClick: action(null, doPreview) }, eff.cls === "mutate" ? "Preview blast radius" : "Preview matches"),
+          eff.cls === "mutate" ? (eff.can_dry_run !== false ? h("button", { class: "btn", onClick: action(null, () => run({ apply: false })) }, "Dry-run (job)") : null) : h("button", { class: "btn primary", onClick: action(null, () => run({ apply: false })) }, "Run as job"),
+          eff.cls === "mutate" ? h("button", { class: "btn primary", onClick: action(null, () => run({ apply: true })) }, "Apply (job)") : null);
+      };
+      rawInp.addEventListener("input", () => { lastPreview = null; paintActions(); });
       queryInp.addEventListener("input", () => { lastPreview = null; });
       posInp.addEventListener("input", () => { lastPreview = null; });
       let hist = []; try { hist = JSON.parse(ls.get("beet_hist", "[]")); } catch { hist = []; }
@@ -100,17 +106,19 @@ export default {
           h("div", { class: "row" }, h("h3", { style: { fontSize: "16px" } }, "beet ", cur.name), h("span", { class: "badge " + (cur.cls === "mutate" ? "warn" : cur.cls === "blocked" ? "bad" : "ok") }, cur.cls), cur.aliases.length ? h("span", { class: "muted xs" }, "aliases: " + cur.aliases.join(", ")) : null),
           h("div", { class: "hint" }, cur.blurb),
           isBlocked ? null : h("label", { class: "row small" }, rawMode, " free-form command line"),
-          isBlocked ? null : h("div", { id: "structured" }, field(cur.query === "required" ? "Query (required)" : cur.query === "none" ? "" : "Query (empty = whole library — needs confirmation)", queryInp), cur.positional ? field(cur.positional, posInp) : null,
-            cur.flags.length ? h("div", { class: "card tight mt" }, ...cur.flags.map(f => { const cb = h("input", { type: "checkbox", onChange: () => { lastPreview = null; } }); const val = f.arg ? h("input", { type: "text", class: "input sm mono", placeholder: f.arg, onInput: () => { lastPreview = null; } }) : null; flagEls[f.flag] = { cb, val }; return h("label", { class: "cmd-flag" }, cb, h("code", {}, f.flag), h("span", {}, h("div", { class: "lbl" }, f.label), f.help ? h("div", { class: "hlp" }, f.help) : null), val); })) : null,
+          isBlocked ? null : h("div", { id: "structured", hidden: rawMode.checked }, field(cur.query === "required" ? "Query (required)" : cur.query === "none" ? "" : "Query (empty = whole library — needs confirmation)", queryInp), cur.positional ? field(cur.positional, posInp) : null,
+            cur.flags.length ? h("div", { class: "card tight mt" }, ...cur.flags.map(f => {
+              const cb = h("input", { type: "checkbox", onChange: () => { lastPreview = null; } });
+              const val = f.arg ? h("input", { type: "text", class: "input sm mono", placeholder: f.arg, onInput: () => { lastPreview = null; if (val.value) cb.checked = true; } }) : null;
+              flagEls[f.flag] = { cb, val };
+              return h("div", { class: "cmd-flag" }, h("label", { class: "row", style: { flex: 1, cursor: "pointer" } }, cb, h("code", {}, f.flag), h("span", {}, h("div", { class: "lbl" }, f.label), f.help ? h("div", { class: "hlp" }, f.help) : null)), val);
+            })) : null,
             Object.keys(cur.blocked).length ? h("div", { class: "hint mt" }, "blocked flags: ", ...Object.entries(cur.blocked).map(([k, v]) => h("span", { class: "badge bad", style: { marginRight: "4px" }, title: v }, k))) : null),
-          isBlocked ? null : h("div", { id: "rawbox", hidden: true }, rawInp),
-          isBlocked ? null : h("div", { class: "row mt" },
-            cur.quick ? h("button", { class: "btn", onClick: action(null, () => run({ quick: true })) }, "Run (inline)") : null,
-            h("button", { class: "btn", onClick: action(null, doPreview) }, cur.cls === "mutate" ? "Preview blast radius" : "Preview matches"),
-            cur.cls === "mutate" ? (cur.can_dry_run !== false ? h("button", { class: "btn", onClick: action(null, () => run({ apply: false })) }, "Dry-run (job)") : null) : h("button", { class: "btn primary", onClick: action(null, () => run({ apply: false })) }, "Run as job"),
-            cur.cls === "mutate" ? h("button", { class: "btn primary", onClick: action(null, () => run({ apply: true })) }, "Apply (job)") : null),
+          isBlocked ? null : h("div", { id: "rawbox", hidden: !rawMode.checked }, rawInp),
+          isBlocked ? null : actionsRow,
           h("div", { class: "hint mt" }, "Runs as ", h("code", { class: "mono xs" }, cat.wrapper), " — every HTTP call capped at 30 s. ", cur.confirm.length ? h("span", {}, h("code", {}, cur.confirm.join(" ")), " is added only on Apply; a dry-run prints beets' plan and aborts at the prompt.") : (cur.can_dry_run === false ? "No dry-run mode — preview matches first, then Apply." : null)));
-        rawMode.onchange = () => { lastPreview = null; form.querySelector("#structured").hidden = rawMode.checked; form.querySelector("#rawbox").hidden = !rawMode.checked; if (rawMode.checked && !rawInp.value) rawInp.value = cur.name + " " + queryInp.value; };
+        paintActions();
+        rawMode.onchange = () => { lastPreview = null; form.querySelector("#structured").hidden = rawMode.checked; form.querySelector("#rawbox").hidden = !rawMode.checked; if (rawMode.checked && !rawInp.value) rawInp.value = cur.name + (queryInp.value ? " " + queryInp.value : ""); paintActions(); };
       };
       const body = () => {
         if (rawMode.checked) return { raw: rawInp.value.trim() };
@@ -128,39 +136,36 @@ export default {
         } catch (e) { lastPreview = null; mount(preview, h("div", { class: "notice bad" }, e.message)); }
       }
       async function run({ apply = false, quick = false } = {}) {
+        const eff = activeCmd();
         const b = { ...body(), apply, quick };
-        if (apply && cur.cls === "mutate") {
+        if (apply && eff.cls === "mutate") {
           if (!lastPreview) await doPreview();
           if (lastPreview?.needs_confirm) { if (!(await confirm({ title: `Apply to ${fmt.num(lastPreview.count)} rows?`, body: `This exceeds the soft cap (${cat.soft_max}) or has an empty query. Type the count to confirm.`, ok: "Apply", danger: true, typed: String(lastPreview.count) }))) return; b.confirm_count = lastPreview.count; }
-          else if (!(await confirm({ title: "Apply?", body: lastPreview ? `${lastPreview.command} → ${lastPreview.count} rows` : b.raw || `beet ${cur.name}`, ok: "Apply" }))) return;
+          else if (!(await confirm({ title: "Apply?", body: lastPreview ? `${lastPreview.command} → ${lastPreview.count ?? "all"} rows` : b.raw || `beet ${eff.name}`, ok: "Apply" }))) return;
         }
         try {
-          const res = await api("/api/beets/run", b);
-          const quoteArg = (a) => (a === "" || /[\s"'\\]/.test(a)) ? JSON.stringify(a) : a;
+          const res = await confirmBeetsRun(b, "Apply");
+          if (!res) return;
           const cmdline = res.argv ? "beet " + res.argv.map(quoteArg).join(" ") : (res.job?.title || "");
           if (cmdline) { hist.unshift({ cmd: cmdline, ts: Date.now() / 1000 }); ls.set("beet_hist", JSON.stringify(hist.slice(0, 30))); paintHist(); }
           if (res.quick) { mount(preview, h("div", { class: "card" }, h("h3", {}, "Output", h("span", { class: "right" }, `exit ${res.exit_code}`)), logView(res.output || "(no output)", { tall: true }))); return; }
           if (res.ok) { toast("Job started", "ok"); openJob(res.job.id); } else toast(res.error, "bad");
-        } catch (e) {
-          if (e.status === 409 && e.data.needs_confirm) { if (await confirm({ title: `Touch ${e.data.count} rows?`, ok: "Apply", danger: true, typed: String(e.data.count) })) { const res = await api("/api/beets/run", { ...b, confirm_count: e.data.count }); if (res.ok) openJob(res.job.id); } }
-          else errToast(e);
-        }
+        } catch (e) { errToast(e); }
       }
       const histBox = h("div", {});
-      const paintHist = () => mount(histBox, hist.length ? h("div", { class: "card tight" }, h("h3", {}, "History"), ...hist.slice(0, 12).map(x => h("div", { class: "row small", style: { padding: "3px 0" } }, h("code", { class: "mono xs ellip", style: { flex: 1, cursor: "pointer" }, title: "load", onClick: () => { rawMode.checked = true; rawMode.onchange(); rawInp.value = x.cmd.replace(/^beet /, ""); lastPreview = null; } }, x.cmd), h("span", { class: "muted xs" }, fmt.ago(x.ts))))) : null);
+      const paintHist = () => mount(histBox, hist.length ? h("div", { class: "card tight" }, h("h3", {}, "History"), ...hist.slice(0, 12).map(x => h("div", { class: "row small", style: { padding: "3px 0" } }, h("code", { class: "mono xs ellip", style: { flex: 1, cursor: "pointer" }, title: "load", onClick: () => { rawMode.checked = true; rawInp.value = x.cmd.replace(/^beet /, ""); rawMode.onchange(); lastPreview = null; } }, x.cmd), h("span", { class: "muted xs" }, fmt.ago(x.ts))))) : null);
       const cheat = h("details", { class: "acc" }, h("summary", {}, "Query cheat-sheet"), h("div", { class: "acc-body hint" }, h("table", { class: "mini-tbl" },
         ...[["artist:Radiohead", "field match (substring)"], ["albumartist:\"Kanye West\"", "quoted multi-word"], ["album_id:123", "one album row"], ["id:456", "one track row"], ["year:1990..1999", "range"], ["format:FLAC", "exact-ish"], ["^genre:Rock", "negate"], ["title::^Blue$", "regex (::)"], ["added:-1w..", "added last week"], ["bitrate:..192000", "≤ 192 kbps"], ["a , b", "OR (comma)"], ["mb_albumid:", "empty field"]].map(([q, d]) => h("tr", {}, h("td", {}, h("a", { href: "#", onClick: (e) => { e.preventDefault(); queryInp.value = (queryInp.value + " " + q).trim(); lastPreview = null; } }, q)), h("td", {}, d))))));
       mount(out, h("div", { class: "spread" }, h("div", { class: "stack" }, h("div", { class: "card" }, pickSel, form), preview), h("div", { class: "stack" }, h("div", { class: "card tight desk-only" }, picker), cheat, histBox)));
       paintPicker(); paintForm(); paintHist();
-      if (r.q.query) doPreview();
+      if (rq.query) doPreview();
     }
 
     // ---------------- scripts ----------------
-    async function scripts(myGen) {
-      const cat = await api("/api/beets/scripts");
-      if (myGen !== tabGen || !out.isConnected) return;
-      const hcmds = (await api("/api/hunter/commands")).commands;
-      if (myGen !== tabGen || !out.isConnected) return;
+    async function scripts({ alive }) {
+      const [cat, hres] = await Promise.all([api("/api/beets/scripts"), api("/api/hunter/commands")]);
+      if (!alive()) return;
+      const hcmds = hres.commands;
       const tierCls = { safe: "ok", recovery: "warn", heavy: "info", maint: "dim" };
       const card = (s) => {
         const date = s.accepts_date ? h("input", { class: "input sm", type: "date", style: { maxWidth: "150px" } }) : null;
@@ -188,20 +193,23 @@ export default {
     }
 
     // ---------------- quarantine ----------------
-    async function quarantine(myGen) {
+    async function quarantine({ alive }, forceRefresh = false) {
       const tree = h("div", { class: "tree card tight" });
       const pane = h("div", {});
       mount(out, h("div", { class: "hint mb" }, "Failed imports by date and reason. Each reason dir says what went wrong: ", h("code", {}, "beet_rc_N"), " non-zero exit · ", h("code", {}, "unverified"), " no fingerprint/MB match · ", h("code", {}, "duplicates"), " identical existing · ", h("code", {}, "recovery"), " what dedup/cleanup scripts moved (never deleted)."),
         h("div", { class: "spread tree" }, tree, pane));
-      const q = await api("/api/beets/quarantine?refresh=" + (r.q.refresh ? "1" : "0"));
-      if (myGen !== tabGen || !out.isConnected) return;
+      const q = await api("/api/beets/quarantine?refresh=" + (forceRefresh || route().q.refresh ? "1" : "0"));
+      if (!alive()) return;
       if (!q.ok) { mount(pane, h("div", { class: "notice bad" }, q.error)); return; }
-      mount(tree, h("div", { class: "row between", style: { padding: "4px 8px" } }, h("b", {}, `${fmt.num(q.total)} entries`), h("button", { class: "btn xs ghost", onClick: () => { r.q.refresh = 1; quarantine(myGen); } }, "↻")),
+      mount(tree, h("div", { class: "row between", style: { padding: "4px 8px" } }, h("b", {}, `${fmt.num(q.total)} entries`), h("button", { class: "btn xs ghost", onClick: () => quarantine({ alive }, true) }, "↻")),
         ...q.buckets.map(b => h("details", { open: b === q.buckets[0] }, h("summary", { class: "node" }, b.name, h("span", { class: "n" }, fmt.num(b.total))), h("div", { class: "kids" }, ...b.reasons.map(rs => h("div", { class: "node", onClick: (e) => { tree.querySelectorAll(".node.active").forEach(n => n.classList.remove("active")); e.currentTarget.classList.add("active"); showReason(b.name, rs.name); } }, rs.name, h("span", { class: "n" }, rs.count + (rs.capped ? "+" : ""))))))));
       mount(pane, h("div", { class: "empty" }, "Pick a bucket → reason."));
+      let reasonGen = 0;
       async function showReason(bucket, reason, offset = 0) {
+        const myR = ++reasonGen;
         mount(pane, h("div", { class: "skel" }, h("div"), h("div")));
         const d = await api(`/api/beets/quarantine/entries${qs({ bucket, reason, offset })}`);
+        if (!alive() || myR !== reasonGen) return;
         const isDate = /^\d{4}-\d{2}-\d{2}$/.test(bucket);
         mount(pane, h("div", { class: "row mb" }, h("h3", { style: { fontSize: "15px" } }, `${bucket} / ${reason}`), h("span", { class: "muted small" }, `${fmt.num(d.total)} entries`), h("span", { class: "ml-auto" }),
             isDate ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/beets/scripts/run", { id: "recover_quarantine", apply: false, date: bucket }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, "Recover (dry-run)") : null,
@@ -209,7 +217,10 @@ export default {
             isDate ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/beets/scripts/run", { id: "quarantine_retry", date: bucket }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, "Retry autotag") : null),
           h("div", { class: "mono xs muted mb" }, d.container_path),
           h("div", { class: "list card" }, ...d.entries.map(e => h("div", { class: "item click", onClick: () => showEntry(bucket, reason, e.name) }, h("div", { class: "main" }, h("div", { class: "t small" }, e.is_dir ? "📁 " : "", e.name), h("div", { class: "s" }, fmt.ago(e.mtime), e.is_dir ? ` · ${e.audio} audio` : ` · ${fmt.bytes(e.size)}`, e.reason_txt ? h("span", { class: "ellip", style: { maxWidth: "420px" } }, " · " + e.reason_txt.split("\n")[0]) : null))))),
-          d.total > offset + 100 ? h("button", { class: "btn mt", onClick: () => showReason(bucket, reason, offset + 100) }, "Next page") : null);
+          d.total > 100 ? h("div", { class: "row between mt" },
+            h("button", { class: "btn sm ghost", disabled: offset <= 0, onClick: () => showReason(bucket, reason, Math.max(0, offset - 100)) }, "‹ Prev"),
+            h("span", { class: "muted small" }, `${fmt.num(offset + 1)}–${fmt.num(Math.min(offset + 100, d.total))} of ${fmt.num(d.total)}`),
+            h("button", { class: "btn sm ghost", disabled: offset + 100 >= d.total, onClick: () => showReason(bucket, reason, offset + 100) }, "Next ›")) : null);
       }
       async function showEntry(bucket, reason, name) {
         const e = await api(`/api/beets/quarantine/entry${qs({ bucket, reason, name })}`).catch(errToast); if (!e) return;
@@ -220,31 +231,30 @@ export default {
     }
 
     // ---------------- logs ----------------
-    async function logs(myGen) {
+    async function logs({ alive, setPoll }) {
       const names = (await api("/api/beets/logs")).sources;
-      if (myGen !== tabGen || !out.isConnected) return;
-      let name = r.q.log || "beets-watcher", lines = 300, follow = true;
-      const sel_ = h("select", { class: "select sm", onChange: (e) => { name = e.target.value; setQuery({ log: name }); tick(); } }, ...names.map(n => h("option", { value: n, selected: n === name }, n)));
-      const linesSel = h("select", { class: "select sm", onChange: (e) => { lines = +e.target.value; tick(); } }, ...[100, 300, 1000, 2000].map(n => h("option", { value: n, selected: n === lines }, n + " lines")));
+      if (!alive()) return;
+      let name = route().q.log || "beets-watcher", lines = 300, follow = true, auto = true, raw = "";
+      if (!names.includes(name) && names.length) name = names[0];
+      const sel_ = h("select", { class: "select sm", onChange: (e) => { name = e.target.value; setQuery({ log: name }); tick(true); } }, ...names.map(n => h("option", { value: n, selected: n === name }, n)));
+      const linesSel = h("select", { class: "select sm", onChange: (e) => { lines = +e.target.value; tick(true); } }, ...[100, 300, 1000, 2000].map(n => h("option", { value: n, selected: n === lines }, n + " lines")));
       const filt = h("input", { class: "input sm", placeholder: "grep", style: { maxWidth: "220px" } });
       const logEl = h("pre", { class: "log tall" });
-      let raw = "";
       const paintLog = () => { const f = filt.value.trim().toLowerCase(); setLog(logEl, f ? raw.split("\n").filter(l => l.toLowerCase().includes(f)).join("\n") : raw); if (follow) logEl.scrollTop = logEl.scrollHeight; };
       filt.addEventListener("input", paintLog);
       logEl.addEventListener("scroll", () => { follow = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30; });
       mount(out, h("div", { class: "filterbar" }, sel_, linesSel, filt, h("label", { class: "row small ml-auto" }, h("input", { type: "checkbox", checked: true, onChange: (e) => { auto = e.target.checked; } }), "auto-refresh")), logEl);
-      let auto = true;
-      const tick = async () => {
-        if (!auto && raw) return;
+      const tick = async (force = false) => {
+        if (!force && !auto && raw) return;
         try {
           const res = await api(`/api/beets/logs${qs({ name, lines })}`);
-          if (myGen !== tabGen || !out.isConnected) return;
+          if (!alive()) return;
           raw = res.text;
           paintLog();
-        } catch (e) { if (myGen === tabGen && out.isConnected) setLog(logEl, e.message); }
+        } catch (e) { if (alive()) setLog(logEl, e.message); }
       };
-      stopSubPoll = poll(tick, 5000);
+      setPoll(poll(() => tick(false), 5000));
     }
-    go();
+    tabCtl.go();
   },
 };
