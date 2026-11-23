@@ -8,6 +8,7 @@ from __future__ import annotations
 import email.utils
 import math
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -81,16 +82,52 @@ def parse_retry_after(
 
 
 def default_user_agent(cfg: Any = None, component: str = "hunter") -> str:
-    """Build a standard User-Agent using ``HUNTER_APP_NAME`` and
-    ``hunter.__version__`` plus optional operator contact from
+    """Build a standard User-Agent using ``cfg.app_name`` (or ``HUNTER_APP_NAME``)
+    and ``hunter.__version__`` plus optional operator contact from
     ``cfg.user_agent_contact`` (no hardcoded PII)."""
-    app = (os.environ.get("HUNTER_APP_NAME") or "").strip() or "Hunter"
+    app_cfg = (getattr(cfg, "app_name", "") or "").strip() if cfg is not None else ""
+    app = app_cfg or (os.environ.get("HUNTER_APP_NAME") or "").strip() or "Hunter"
     comp = (component or "hunter").strip()
     base = f"{app}-{comp}/{__version__}"
     contact = ""
     if cfg is not None:
         contact = (getattr(cfg, "user_agent_contact", "") or "").strip()
     return f"{base} ({contact})" if contact else base
+
+
+class RateLimiter:
+    """Thread-safe monotonic slot scheduler for polite public APIs (MB, LB).
+
+    Reserves the next slot under lock and sleeps outside the lock so waiting
+    threads queue cleanly without blocking slot reservation.
+    """
+
+    def __init__(self, min_interval: float) -> None:
+        self._min_interval = max(0.0, float(min_interval))
+        self._lock = threading.Lock()
+        self._next_slot = 0.0
+
+    def acquire(self, min_interval: float | None = None) -> None:
+        step = self._min_interval if min_interval is None else max(0.0, float(min_interval))
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_slot)
+            self._next_slot = slot + step
+        delay = slot - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def push_back(self, delay: float) -> None:
+        """Advance the next allowed slot by at least *delay* seconds (e.g. Retry-After)."""
+        wait = max(0.0, float(delay))
+        if wait <= 0:
+            return
+        with self._lock:
+            self._next_slot = max(self._next_slot, time.monotonic() + wait)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._next_slot = 0.0
 
 
 class HttpSession:
@@ -137,6 +174,9 @@ class HttpSession:
     def close(self) -> None:
         self._session.close()
 
+    def clear_cookies(self) -> None:
+        self._session.cookies.clear()
+
     def _pace(self) -> None:
         if self._min_interval > 0 and self._last_request_mono is not None:
             wait = self._min_interval - (time.monotonic() - self._last_request_mono)
@@ -167,7 +207,7 @@ class HttpSession:
                 )
             except requests.RequestException as exc:
                 if attempt + 1 < attempts:
-                    time.sleep(min(2.0 ** attempt, retry_cap))
+                    time.sleep(min(2.0 ** min(attempt, 30), retry_cap))
                     continue
                 raise HttpError(f"{method.upper()} {url}: {exc}") from exc
 
@@ -175,10 +215,12 @@ class HttpSession:
                 ra = parse_retry_after(
                     resp.headers.get("Retry-After"), default=5.0, cap=retry_cap
                 )
-                if attempt + 1 < attempts:
+                if 429 in retry_statuses and attempt + 1 < attempts:
+                    resp.close()
                     time.sleep(ra)
                     continue
                 if raise_for_status:
+                    resp.close()
                     raise RateLimitError(
                         f"HTTP 429 on {url}", status=429, retry_after=ra
                     )
@@ -187,9 +229,10 @@ class HttpSession:
             if resp.status_code in retry_statuses and attempt + 1 < attempts:
                 ra = parse_retry_after(
                     resp.headers.get("Retry-After"),
-                    default=min(2.0 ** attempt, retry_cap),
+                    default=min(2.0 ** min(attempt, 30), retry_cap),
                     cap=retry_cap,
                 )
+                resp.close()
                 time.sleep(ra)
                 continue
 
@@ -201,9 +244,11 @@ class HttpSession:
                     if "Retry-After" in resp.headers
                     else None
                 )
+                status = resp.status_code
+                resp.close()
                 raise HttpError(
-                    f"HTTP {resp.status_code} on {url}",
-                    status=resp.status_code,
+                    f"HTTP {status} on {url}",
+                    status=status,
                     retry_after=ra,
                 )
             return resp
@@ -236,6 +281,7 @@ __all__ = [
     "HttpError",
     "HttpSession",
     "RateLimitError",
+    "RateLimiter",
     "default_user_agent",
     "parse_retry_after",
 ]

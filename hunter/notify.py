@@ -7,18 +7,13 @@ silence critical alerts.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
-import os
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 from urllib.parse import urlparse
 
-import requests
-
+from hunter import lock
 from hunter.domain import atomic_write_json
 from hunter.http_client import HttpError, HttpSession
 
@@ -30,11 +25,11 @@ HTTP_TIMEOUT = 10
 def _detect_kind(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    path = parsed.path.lower()
+    path = parsed.path.lower().rstrip("/")
     query = parsed.query.lower()
     if host in ("discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com") and "/api/webhooks/" in path:
         return "discord"
-    if "/message" in path or "token=" in query:
+    if path.endswith("/message") or "token=" in query:
         return "gotify"
     return "ntfy"
 
@@ -47,19 +42,8 @@ class Notifier:
         self._stamp = self._state_dir / "last_notify.txt"
         self._lock_path = self._state_dir / "notify.lock"
 
-    @contextmanager
-    def _locked(self) -> Iterator[None]:
-        self._state_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+    def _locked(self):
+        return lock.hold(self._lock_path, blocking=True)
 
     def _read_buckets(self) -> dict[str, float]:
         try:
@@ -130,32 +114,41 @@ class Notifier:
         if force:
             try:
                 self._post(message, title=title, tags=tags, priority=priority)
-            except (HttpError, requests.RequestException) as exc:
+            except HttpError as exc:
                 log.warning("notification failed: %s", exc)
                 return False
             try:
                 with self._locked():
                     self._write_bucket(bucket_key, time.time())
-            except OSError:
-                pass
+            except OSError as exc:
+                log.debug("notification timestamp write failed: %s", exc)
             return True
 
-        with self._locked():
-            buckets = self._read_buckets()
-            last = buckets.get(bucket_key)
-            if last is not None and (time.time() - last) < self.min_interval:
-                log.debug("notification suppressed (rate limit, bucket=%s): %s", bucket_key, message)
-                return False
+        try:
+            with self._locked():
+                buckets = self._read_buckets()
+                last = buckets.get(bucket_key)
+                if last is not None and (time.time() - last) < self.min_interval:
+                    log.debug("notification suppressed (rate limit, bucket=%s): %s", bucket_key, message)
+                    return False
+                try:
+                    self._post(message, title=title, tags=tags, priority=priority)
+                except HttpError as exc:
+                    log.warning("notification failed: %s", exc)
+                    return False
+                try:
+                    self._write_bucket(bucket_key, time.time())
+                except OSError as exc:
+                    log.debug("notification timestamp write failed: %s", exc)
+                return True
+        except OSError as exc:
+            log.warning("notification lock unavailable, sending unthrottled: %s", exc)
             try:
                 self._post(message, title=title, tags=tags, priority=priority)
-            except (HttpError, requests.RequestException) as exc:
-                log.warning("notification failed: %s", exc)
+                return True
+            except HttpError as post_exc:
+                log.warning("notification failed: %s", post_exc)
                 return False
-            try:
-                self._write_bucket(bucket_key, time.time())
-            except OSError:
-                pass
-            return True
 
 
 __all__ = ["HTTP_TIMEOUT", "Notifier"]

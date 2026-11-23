@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import errno as _errno
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 MOUNTINFO = "/proc/self/mountinfo"
-# Backwards-compat module constant (summary() prefers cfg.storage_fstype).
-REQUIRED_FSTYPE = os.environ.get("HUNTER_STORAGE_FSTYPE", "").strip() or None
 _UNSET = object()
 
 
@@ -63,9 +61,6 @@ class MountProbe:
     error: str
     free_bytes: int | None
 
-    def as_dict(self) -> dict:
-        return asdict(self)
-
     def reason(
         self,
         required_fstype: str | None = None,
@@ -89,9 +84,6 @@ class MountProbe:
         if must_exist and not self.exists:
             return f"{self.resolved} does not exist"
         return None
-
-    def ok(self, required_fstype: str | None = None, *, must_exist: bool = True) -> bool:
-        return self.reason(required_fstype, must_exist=must_exist) is None
 
 
 def _fmt_errno(exc: OSError) -> tuple[int | None, str]:
@@ -236,4 +228,4 @@ def summary(
     return out
 
 
-__all__ = ["MountProbe", "REQUIRED_FSTYPE", "enclosing_mount", "probe", "summary"]
+__all__ = ["MountProbe", "enclosing_mount", "probe", "summary"]

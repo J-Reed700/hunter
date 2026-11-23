@@ -22,11 +22,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+from hunter import lock
 from hunter.domain import atomic_write_json, atomic_write_text
 
 log = logging.getLogger("hunter.config")
 
 _VALID_WANT_SOURCES = frozenset({"saved_albums", "playlists"})
+_ENV_PREFIXES = (
+    "HUNTER_",
+    "SLSKD_",
+    "NAVIDROME_",
+    "PROWLARR_",
+    "SPOTIFY_",
+    "AUDIOMUSE_",
+    "NOTIFY_",
+    "BEETS_",
+    "DOCKER_SOCK",
+)
 _DEFAULT_TRUSTED_PROXIES = (
     "127.0.0.0/8",
     "::1/128",
@@ -200,7 +212,7 @@ def save_tunables(cfg: "HunterConfig", patch: dict[str, Any]) -> dict[str, int |
     """Validate *patch* against ``UI_TUNABLE`` and atomically persist to
     ``settings.json``. Returns the dict of keys actually applied."""
     target = cfg.state_dir / "settings.json"
-    with _WRITE_LOCK:
+    with _WRITE_LOCK, lock.hold(cfg.state_dir / "settings.lock", blocking=True):
         current = _read_json_dict(target)
         applied: dict[str, int | bool] = {}
         for key, raw in patch.items():
@@ -208,7 +220,8 @@ def save_tunables(cfg: "HunterConfig", patch: dict[str, Any]) -> dict[str, int |
                 continue
             try:
                 val = parse_tunable(key, raw)
-            except ValueError:
+            except ValueError as exc:
+                log.warning("ignoring invalid tunable %s: %s", key, exc)
                 continue
             current[key] = applied[key] = val
         if applied:
@@ -251,14 +264,58 @@ def save_spotify_token(
     updates: dict[str, Any],
 ) -> dict[str, Any]:
     """Atomically merge-write ``spotify_token.json`` with ``0o600`` permissions
-    so ``sp_dc`` and ``refresh_token`` never clobber each other."""
+    under a cross-process flock so ``sp_dc`` and ``refresh_token`` never clobber
+    each other across web UI and CLI/pass processes."""
     token_path = target.token_file if isinstance(target, HunterConfig) else Path(target)
-    with _WRITE_LOCK:
+    lock_path = token_path.parent / f".{token_path.name}.lock"
+    with _WRITE_LOCK, lock.hold(lock_path, blocking=True):
         current = _read_json_dict(token_path)
         merged = {**current, **updates}
         atomic_write_json(token_path, merged, mode=0o600, indent=2)
         clear_config_cache()
         return merged
+
+
+def delete_spotify_token(target: "Path | HunterConfig") -> None:
+    """Remove ``spotify_token.json`` under the same cross-process flock."""
+    token_path = target.token_file if isinstance(target, HunterConfig) else Path(target)
+    lock_path = token_path.parent / f".{token_path.name}.lock"
+    with _WRITE_LOCK, lock.hold(lock_path, blocking=True):
+        try:
+            token_path.unlink()
+        except FileNotFoundError:
+            pass
+        clear_config_cache()
+
+
+# --- Normalized beets-container accessors (also accept SimpleNamespace) ---
+
+def beets_python_bin(cfg: Any = None) -> str:
+    val = getattr(cfg, "beets_python", None) if cfg is not None else None
+    return val.strip() if isinstance(val, str) and val.strip() else "python3"
+
+
+def beets_automation_dir_str(cfg: Any = None) -> str:
+    val = getattr(cfg, "beets_automation_container_dir", None) if cfg is not None else None
+    if isinstance(val, str) and val.strip():
+        return val.strip().rstrip("/") or "/config/automation"
+    return "/config/automation"
+
+
+def beets_quarantine_root_str(cfg: Any = None) -> str:
+    val = getattr(cfg, "beets_quarantine_root", None) if cfg is not None else None
+    if isinstance(val, str) and val.strip():
+        return val.strip().rstrip("/") or "/quarantine"
+    return "/quarantine"
+
+
+def beets_exec_user_str(cfg: Any = None) -> str:
+    val = getattr(cfg, "beets_exec_user", "") if cfg is not None else ""
+    return val.strip() if isinstance(val, str) else ""
+
+
+def beets_job_script(cfg: Any, name: str) -> str:
+    return f"{beets_automation_dir_str(cfg)}/jobs/{name.lstrip('/')}"
 
 
 @dataclass(frozen=True)
@@ -339,6 +396,7 @@ class HunterConfig:
     spotify_proxy: str = ""
     storage_fstype: str | None = None
     trusted_proxies: tuple[str, ...] = _DEFAULT_TRUSTED_PROXIES
+    app_name: str = "Hunter"
     user_agent_contact: str = ""
     miss_retry_seconds: int = 259_200
     dl_max_bundle_bytes: int = 30 * (1 << 30)
@@ -380,9 +438,21 @@ class HunterConfig:
         apply_path = state_dir / "apply_override"
         app_path = state_dir / "spotify_app.json"
 
-        env_sig = tuple(sorted(os.environ.items()))
+        env_sig = tuple(
+            sorted(
+                (k, v)
+                for k, v in os.environ.items()
+                if k == "DOCKER_SOCK" or k.startswith(_ENV_PREFIXES)
+            )
+        )
+        q_exists = (
+            Path("/quarantine").exists()
+            if "HUNTER_QUARANTINE_DIR" not in os.environ
+            else None
+        )
         cache_key = (
             env_sig,
+            q_exists,
             _stat_sig(settings_path),
             _stat_sig(apply_path),
             _stat_sig(app_path),
@@ -479,41 +549,29 @@ class HunterConfig:
         dl_max_bundle_default = int(
             _env_float("HUNTER_DL_MAX_GB", 30.0, 0.1, 500.0) * (1 << 30)
         )
-        dl_max_bundle_bytes = (
-            _env_int(
-                "HUNTER_DL_MAX_BUNDLE_BYTES",
-                dl_max_bundle_default,
-                1,
-                500 * (1 << 30),
-            )
-            if (os.environ.get("HUNTER_DL_MAX_BUNDLE_BYTES") or "").strip()
-            else dl_max_bundle_default
+        dl_max_bundle_bytes = _env_int(
+            "HUNTER_DL_MAX_BUNDLE_BYTES",
+            dl_max_bundle_default,
+            1,
+            500 * (1 << 30),
         )
         dl_keep_default = int(
             _env_float("HUNTER_DL_KEEP_GB", 60.0, 0.1, 2000.0) * (1 << 30)
         )
-        dl_keep_bytes = (
-            _env_int(
-                "HUNTER_DL_KEEP_BYTES",
-                dl_keep_default,
-                1,
-                2000 * (1 << 30),
-            )
-            if (os.environ.get("HUNTER_DL_KEEP_BYTES") or "").strip()
-            else dl_keep_default
+        dl_keep_bytes = _env_int(
+            "HUNTER_DL_KEEP_BYTES",
+            dl_keep_default,
+            1,
+            2000 * (1 << 30),
         )
         dl_ttl_default = int(
             _env_float("HUNTER_DL_TTL_HOURS", 24.0, 0.1, 720.0) * 3600
         )
-        dl_ttl_seconds = (
-            _env_int(
-                "HUNTER_DL_TTL_SECONDS",
-                dl_ttl_default,
-                60,
-                720 * 3600,
-            )
-            if (os.environ.get("HUNTER_DL_TTL_SECONDS") or "").strip()
-            else dl_ttl_default
+        dl_ttl_seconds = _env_int(
+            "HUNTER_DL_TTL_SECONDS",
+            dl_ttl_default,
+            60,
+            720 * 3600,
         )
 
         return cls(
@@ -596,6 +654,7 @@ class HunterConfig:
             spotify_proxy=_env_str("SPOTIFY_PROXY", ""),
             storage_fstype=storage_fstype,
             trusted_proxies=_env_csv("HUNTER_TRUSTED_PROXIES", _DEFAULT_TRUSTED_PROXIES),
+            app_name=_env_str("HUNTER_APP_NAME", "Hunter"),
             user_agent_contact=_env_str("HUNTER_USER_AGENT_CONTACT", ""),
             miss_retry_seconds=_env_int(
                 "HUNTER_MISS_RETRY_SECONDS", 259_200, 60, 30 * 86_400
@@ -655,7 +714,13 @@ class HunterConfig:
 
 __all__ = [
     "HunterConfig",
+    "beets_automation_dir_str",
+    "beets_exec_user_str",
+    "beets_job_script",
+    "beets_python_bin",
+    "beets_quarantine_root_str",
     "clear_config_cache",
+    "delete_spotify_token",
     "parse_tunable",
     "save_apply_override",
     "save_spotify_app",

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 _SCHEMA_LOCK = threading.Lock()
-_INITIALIZED: set[str] = set()
+_INITIALIZED: dict[str, tuple[int, int]] = {}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS wants (
@@ -141,12 +141,14 @@ CREATE TABLE IF NOT EXISTS sp_tracks (
     title TEXT NOT NULL,
     artist TEXT NOT NULL,
     album TEXT NOT NULL,
+    album_artist TEXT NOT NULL DEFAULT '',
     album_id TEXT NOT NULL DEFAULT '',
     year INTEGER NOT NULL DEFAULT 0,
     duration_s INTEGER NOT NULL DEFAULT 0,
     album_total INTEGER NOT NULL DEFAULT 0,
     liked_gen INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_sp_tracks_album ON sp_tracks(album_id);
 
 CREATE TABLE IF NOT EXISTS sp_playlist_tracks (
     playlist_id TEXT NOT NULL,
@@ -156,6 +158,7 @@ CREATE TABLE IF NOT EXISTS sp_playlist_tracks (
     PRIMARY KEY (playlist_id, track_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sp_pl_tracks ON sp_playlist_tracks(playlist_id, pos);
+CREATE INDEX IF NOT EXISTS idx_sp_pl_track_id ON sp_playlist_tracks(track_id);
 
 CREATE TABLE IF NOT EXISTS sp_saved_albums (
     album_id TEXT PRIMARY KEY,
@@ -244,6 +247,7 @@ _COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("playlists", "tracks_synced_ts", "INTEGER NOT NULL DEFAULT 0"),
     ("playlists", "owner", "TEXT NOT NULL DEFAULT ''"),
     ("playlists", "gen", "INTEGER NOT NULL DEFAULT 0"),
+    ("sp_tracks", "album_artist", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -276,13 +280,22 @@ def _connect_rw(path: Path, timeout: float) -> sqlite3.Connection:
         raise
 
 
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
 def open_hunter_db(path: Path, timeout: float = 30.0) -> sqlite3.Connection:
     """Open ``hunter.db`` with WAL, foreign keys, busy_timeout, and one-time
-    thread-safe DDL + per-column idempotent migrations per DB path per process."""
+    thread-safe DDL + per-column idempotent migrations per DB inode per process."""
     path = Path(path)
     key = str(path.resolve())
     with _SCHEMA_LOCK:
-        needs_init = (key not in _INITIALIZED) or (not path.exists())
+        ident = _file_identity(path)
+        needs_init = ident is None or _INITIALIZED.get(key) != ident
         if needs_init:
             path.parent.mkdir(parents=True, exist_ok=True)
             conn = _connect_rw(path, timeout)
@@ -294,7 +307,9 @@ def open_hunter_db(path: Path, timeout: float = 30.0) -> sqlite3.Connection:
             except Exception:
                 conn.close()
                 raise
-            _INITIALIZED.add(key)
+            new_ident = _file_identity(path)
+            if new_ident is not None:
+                _INITIALIZED[key] = new_ident
             return conn
     return _connect_rw(path, timeout)
 
@@ -327,31 +342,37 @@ def backup_sqlite(src_path: Path, dst_path: Path, timeout: float = 30.0) -> Path
         src = open_readonly_db(src_path, timeout=timeout)
         dst = sqlite3.connect(tmp, timeout=timeout)
         src.backup(dst)
+        dst.close()
+        dst = None
+        src.close()
+        src = None
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, dst_path)
     except Exception:
         if dst is not None:
             try:
                 dst.close()
             except sqlite3.Error:
                 pass
-            dst = None
         if src is not None:
             try:
                 src.close()
             except sqlite3.Error:
                 pass
-            src = None
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    finally:
-        if dst is not None:
-            dst.close()
-        if src is not None:
-            src.close()
 
-    os.replace(tmp, dst_path)
     return dst_path
 
 
@@ -403,7 +424,7 @@ def reset_schema_cache(path: Path | None = None) -> None:
         if path is None:
             _INITIALIZED.clear()
         else:
-            _INITIALIZED.discard(str(Path(path).resolve()))
+            _INITIALIZED.pop(str(Path(path).resolve()), None)
 
 
 __all__ = [
