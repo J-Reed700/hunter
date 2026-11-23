@@ -6,8 +6,6 @@ from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
 
-log = common.log
-
 
 @get("/api/jobs", role="operator")
 def jobs(ctx: Ctx):
@@ -108,9 +106,13 @@ def hunter_run(ctx: Ctx):
     if raw_ints is not None and not isinstance(raw_ints, dict):
         return ctx.error(400, "ints must be an object")
     argv = [name]
+    seen_flags: set[str] = set()
     for f in raw_flags or ():
-        if f in spec.get("flags", []):
+        if f in spec.get("flags", []) and f not in seen_flags:
+            seen_flags.add(f)
             argv.append(f)
+    if "--dry-run" in seen_flags and "--apply" in seen_flags:
+        return ctx.error(400, "cannot combine --dry-run and --apply")
     for k, v in (raw_ints or {}).items():
         lim = spec.get("ints", {}).get(k)
         if lim is None:
@@ -121,7 +123,9 @@ def hunter_run(ctx: Ctx):
             iv = int(v)
         except ValueError:
             return ctx.error(400, f"{k} must be an integer")
-        if lim[0] <= iv <= lim[1] and iv:
+        if iv < lim[0] or iv > lim[1]:
+            return ctx.error(400, f"{k} must be between {lim[0]} and {lim[1]}")
+        if iv:
             argv += [k, str(iv)]
     if ctx.bb("verbose"):
         argv.append("-v")

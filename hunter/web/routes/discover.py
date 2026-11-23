@@ -6,12 +6,13 @@ import time
 
 import requests
 
-from hunter import mb
+from hunter import domain, mb
 from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
 
 log = common.log
+_MAX_ENQUEUE_FILES = 500
 
 
 def _ics_escape(val: str) -> str:
@@ -58,9 +59,7 @@ def artist_albums(ctx: Ctx):
             a["artist"] = name
         albums = common.annotate_owned(ctx.cfg, albums)
         with common.state(ctx.cfg) as st:
-            wm = common.want_status_map(
-                st, [f"request:rg:{a['rgid']}" for a in albums]
-            )
+            wm = st.wants_status_map([f"request:rg:{a['rgid']}" for a in albums])
         for a in albums:
             a["want"] = wm.get(f"request:rg:{a['rgid']}")
         return ctx.json(200, {"albums": albums})
@@ -112,7 +111,7 @@ def slskd_search(ctx: Ctx):
         return ctx.error(400, "query too short")
     if not cfg.slskd_configured:
         return ctx.error(400, "slskd not configured")
-    from hunter.slskd_client import SlskdClient, SlskdError, rank_candidates
+    from hunter.slskd_client import SlskdClient, SlskdError, candidate_to_dict, rank_candidates
 
     with common.state(cfg) as st:
         banned = st.banned_peers()
@@ -134,39 +133,25 @@ def slskd_search(ctx: Ctx):
         min_files=1,
         reputation=rep,
     )
-    out = [
-        {
-            "username": c.username,
-            "dir": c.dir,
-            "dir_leaf": c.dir.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1],
-            "count": c.audio_count,
-            "lossless": c.lossless,
-            "bitrate": c.avg_bitrate,
-            "queue": c.queue_length,
-            "slot": c.has_free_slot,
-            "size": sum(int(f.get("size") or 0) for f in c.files),
-            "files": [
-                {"filename": f.get("filename"), "size": f.get("size")}
-                for f in c.files
-            ][:120],
-        }
-        for c in ranked[:60]
-    ]
+    out = [candidate_to_dict(c, max_files=120) for c in ranked[:60]]
     return ctx.json(200, {"candidates": out})
 
 
 @post("/api/slskd_download")
 def slskd_download(ctx: Ctx):
     cfg = ctx.cfg
+    if not cfg.slskd_configured:
+        return ctx.error(400, "slskd not configured")
     username, dir_, label = ctx.b("username"), ctx.b("dir"), ctx.b("label")
     files = ctx.body.get("files")
     if (
         not username
         or not isinstance(files, list)
         or not files
+        or len(files) > _MAX_ENQUEUE_FILES
         or not all(isinstance(f, dict) and f.get("filename") for f in files)
     ):
-        return ctx.error(400, "username + files required")
+        return ctx.error(400, f"username + 1-{_MAX_ENQUEUE_FILES} files required")
     from hunter.slskd_client import SlskdClient, SlskdError
 
     try:
@@ -174,11 +159,11 @@ def slskd_download(ctx: Ctx):
             slskd.enqueue(username, files)
     except SlskdError as exc:
         return ctx.error(502, f"slskd: {exc}")
-    leaf = dir_.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or "download"
+    leaf = domain.dir_leaf(dir_) or "download"
     key = f"browse:{username}:{leaf[:80]}"
     with common.state(cfg) as st:
         st.upsert_want(
-            key, label or username, leaf, 0, len(files), "browse", resurrect=True
+            key, label or username, leaf, 0, len(files), "browse", resurrect=True, cfg=cfg
         )
         want_id = st.want_id_by_key(key)
         if want_id is not None:

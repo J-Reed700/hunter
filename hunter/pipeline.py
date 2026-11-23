@@ -98,8 +98,10 @@ def seed_gaps(
     max_expected: int = 40,
     limit: int = 0,
     apply: bool = True,
+    rows: list[tuple[int, str, str, int, int, int]] | None = None,
 ) -> int:
-    rows = gap_rows(cfg, coverage, min_missing, min_expected, max_expected)
+    if rows is None:
+        rows = gap_rows(cfg, coverage, min_missing, min_expected, max_expected)
     if limit > 0:
         rows = rows[:limit]
     if not apply:
@@ -128,8 +130,10 @@ def seed_upgrades(
     min_tracks: int = 4,
     limit: int = 0,
     apply: bool = True,
+    rows: list[tuple[int, str, str, int, int]] | None = None,
 ) -> int:
-    rows = lossy_rows(cfg, min_tracks)
+    if rows is None:
+        rows = lossy_rows(cfg, min_tracks)
     if limit > 0:
         rows = rows[:limit]
     if not apply:

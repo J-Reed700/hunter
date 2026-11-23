@@ -157,7 +157,6 @@ def sessions(ctx: Ctx):
 
 
 @post("/api/auth/session/revoke", role="viewer", audit=False)
-@post("/api/auth/sessions/revoke", role="viewer", audit=False)
 def session_revoke(ctx: Ctx):
     if not ctx.user or ctx.user.via != "cookie":
         return ctx.error(400, "cookie session required")
@@ -206,6 +205,8 @@ def users_create(ctx: Ctx):
 @post("/api/users/update", role="admin", audit=False)
 def users_update(ctx: Ctx):
     uid = ctx.bi("id")
+    if uid <= 0:
+        return ctx.error(400, "id required")
     role = ctx.b("role") or None
     display = ctx.body.get("display")
     disabled = ctx.body.get("disabled")
@@ -239,18 +240,23 @@ def users_update(ctx: Ctx):
 @post("/api/users/password", role="admin", audit=False)
 def users_password(ctx: Ctx):
     uid = ctx.bi("id")
+    if uid <= 0:
+        return ctx.error(400, "id required")
+    if ctx.user and uid == ctx.user.id:
+        return ctx.error(
+            400, "use /api/auth/password to change your own password"
+        )
     with ctx.auth() as a:
         u = a.user(uid)
         if not u:
             return ctx.error(404, "unknown user")
         try:
             new_pw = _raw_pw(ctx, "new")
-            keep = ctx.user.session_id if (ctx.user and uid == ctx.user.id) else ""
             a.set_password(
                 uid,
                 new_pw,
-                must_change=not (ctx.user and uid == ctx.user.id),
-                keep_session=keep,
+                must_change=True,
+                keep_session="",
             )
         except AuthError as exc:
             return _fail(ctx, exc)
@@ -261,6 +267,8 @@ def users_password(ctx: Ctx):
 @post("/api/users/delete", role="admin", audit=False)
 def users_delete(ctx: Ctx):
     uid = ctx.bi("id")
+    if uid <= 0:
+        return ctx.error(400, "id required")
     if ctx.user and uid == ctx.user.id:
         return ctx.error(409, "you cannot delete yourself")
     with ctx.auth() as a:
@@ -284,6 +292,8 @@ def users_sessions(ctx: Ctx):
 @post("/api/users/revoke", role="admin", audit=False)
 def users_revoke(ctx: Ctx):
     uid = ctx.bi("id")
+    if uid <= 0:
+        return ctx.error(400, "id required")
     with ctx.auth() as a:
         u = a.user(uid)
         if not u:

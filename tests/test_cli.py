@@ -140,7 +140,7 @@ class TestCli(unittest.TestCase):
             mock_resp.json.return_value = {"refresh_token": "rt_new"}
             with patch.dict(os.environ, _env_for(tmp), clear=False), \
                  patch("builtins.input", return_value="http://127.0.0.1:8888/callback?code=abc"), \
-                 patch("hunter.cli.HttpSession") as mock_http_cls:
+                 patch("hunter.spotify.HttpSession") as mock_http_cls:
                 mock_http_cls.return_value.__enter__.return_value.post.return_value = mock_resp
                 clear_config_cache()
                 rc = cli.main(["auth"])

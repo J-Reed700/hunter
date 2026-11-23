@@ -18,13 +18,11 @@ import json
 import logging
 import sys
 import time
-import urllib.parse
 from datetime import datetime
 
-from hunter import blocklist, config, domain, pipeline, storage
+from hunter import blocklist, config, domain, pipeline, spotify, storage
 from hunter.auth import ROLES, Auth, AuthError
 from hunter.config import HunterConfig
-from hunter.http_client import HttpError, HttpSession, default_user_agent
 from hunter.library import BeetsLibrary
 from hunter.state import HunterState
 
@@ -94,7 +92,7 @@ def cmd_add(cfg: HunterConfig, args: argparse.Namespace) -> int:
     key = f"manual:{domain.norm_artist(args.artist)}:{domain.norm_album(args.album)}"
     with HunterState(cfg.state_db) as state:
         is_new = state.upsert_want(
-            key, args.artist, args.album, 0, None, "manual", resurrect=True
+            key, args.artist, args.album, 0, None, "manual", resurrect=True, cfg=cfg
         )
         state.log_event("request", args.artist, args.album, "added via cli")
         counts = state.counts()
@@ -153,6 +151,7 @@ def cmd_seed_gaps(cfg: HunterConfig, args: argparse.Namespace) -> int:
             max_expected=args.max_expected,
             limit=args.seed_limit,
             apply=True,
+            rows=rows,
         )
         counts = state.counts()
     print(
@@ -176,7 +175,12 @@ def cmd_seed_upgrades(cfg: HunterConfig, args: argparse.Namespace) -> int:
         return 0
     with HunterState(cfg.state_db) as state:
         new = pipeline.seed_upgrades(
-            cfg, state, min_tracks=args.min_tracks, limit=args.seed_limit, apply=True
+            cfg,
+            state,
+            min_tracks=args.min_tracks,
+            limit=args.seed_limit,
+            apply=True,
+            rows=rows,
         )
         counts = state.counts()
     print(f"seeded {new} upgrade wants ({len(rows)} lossy-only albums)\ncounts: {counts}")
@@ -208,51 +212,32 @@ def cmd_auth(cfg: HunterConfig, _args: argparse.Namespace) -> int:
         )
         return 2
 
-    redirect = "http://127.0.0.1:8888/callback"
-    query = urllib.parse.urlencode({
-        "client_id": cfg.spotify_client_id,
-        "response_type": "code",
-        "redirect_uri": redirect,
-        "scope": "playlist-read-private playlist-read-collaborative user-library-read",
-    })
     print("\n1. Open this URL in a browser and approve access:\n")
-    print(f"   https://accounts.spotify.com/authorize?{query}\n")
+    print(f"   {spotify.oauth_authorize_url(cfg.spotify_client_id)}\n")
     print("2. You'll land on a 127.0.0.1 URL that won't load — that's fine.")
     pasted = input("3. Paste that full redirect URL here: ").strip()
-    code = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query).get("code", [""])[0]
+    code = spotify.extract_oauth_code(pasted)
     if not code:
         print("no ?code= found in that URL")
         return 2
 
-    with HttpSession(
-        timeout=30,
-        user_agent=default_user_agent(cfg),
-        proxy=cfg.spotify_proxy or None,
-    ) as http:
-        try:
-            resp = http.post(
-                "https://accounts.spotify.com/api/token",
-                data={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect},
-                auth=(cfg.spotify_client_id, cfg.spotify_client_secret),
-                timeout=30,
-                raise_for_status=False,
-            )
-        except HttpError as exc:
-            print(f"token exchange failed: {exc}")
-            return 1
-    if resp.status_code != 200:
-        print(f"token exchange failed: {resp.status_code} {resp.text[:300]}")
-        return 1
     try:
-        tok = resp.json()
-    except ValueError as exc:
-        print(f"token exchange returned invalid JSON: {exc}")
+        tok = spotify.oauth_exchange_code(
+            cfg.spotify_client_id,
+            cfg.spotify_client_secret,
+            code,
+            cfg=cfg,
+            proxy=cfg.spotify_proxy,
+        )
+    except spotify.SpotifyError as exc:
+        print(f"token exchange failed: {exc}")
         return 1
-    if not isinstance(tok, dict) or not tok.get("refresh_token"):
+    refresh_token = tok.get("refresh_token") if isinstance(tok, dict) else ""
+    if not refresh_token:
         print(f"no refresh_token in response: {tok}")
         return 1
 
-    config.save_spotify_token(cfg.token_file, {"refresh_token": tok["refresh_token"]})
+    config.save_spotify_token(cfg.token_file, {"refresh_token": refresh_token})
     print(f"\nrefresh token saved → {cfg.token_file}")
     print("passes will sync Spotify from here on. Done.")
     return 0
@@ -341,7 +326,11 @@ def cmd_health(cfg: HunterConfig) -> int:
     except (OSError, ValueError):
         hb = {}
     limit = 2 * cfg.interval + cfg.pass_deadline
-    age = now - float(hb.get("ts") or 0)
+    try:
+        hb_ts = float(hb.get("ts") or 0)
+    except (TypeError, ValueError):
+        hb_ts = 0.0
+    age = now - hb_ts
     if age > limit:
         problems.append(f"heartbeat {int(age)}s old (limit {limit}s)")
     if hb.get("status") == "crashed":
@@ -353,8 +342,14 @@ def cmd_health(cfg: HunterConfig) -> int:
             sup = {}
     except (OSError, ValueError):
         sup = {}
-    failures = int(sup.get("consecutive_failures") or 0)
-    busy_streak = int(sup.get("lock_busy_streak") or 0)
+    try:
+        failures = int(sup.get("consecutive_failures") or 0)
+    except (TypeError, ValueError):
+        failures = 0
+    try:
+        busy_streak = int(sup.get("lock_busy_streak") or 0)
+    except (TypeError, ValueError):
+        busy_streak = 0
     if failures >= pipeline.FAILURE_ALERT_AFTER:
         problems.append(f"{failures} consecutive pass failures (last rc={sup.get('rc')})")
     if busy_streak >= pipeline.FAILURE_ALERT_AFTER + 1:

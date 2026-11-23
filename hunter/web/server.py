@@ -47,6 +47,12 @@ _MUST_CHANGE_ALLOW = frozenset({
     "/api/auth/password",
     "/api/auth/logout",
 })
+# Only calendar feeds and browser-initiated file downloads may authenticate via ?token=
+_QUERY_TOKEN_PATHS = frozenset({
+    "/calendar.ics",
+    "/api/downloads/file",
+    "/api/dl/track",
+})
 _TOKEN_REDACT_RE = re.compile(r"([?&]token=)[^&\s]*", re.IGNORECASE)
 
 _SECURITY_HEADERS = {
@@ -418,11 +424,13 @@ class _Handler(BaseHTTPRequestHandler):
         xfp = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
         return xfp == "https"
 
-    def _token_supplied(self, method: str, query: dict[str, list[str]]) -> str:
+    def _token_supplied(
+        self, method: str, path: str, query: dict[str, list[str]]
+    ) -> str:
         supplied = self.headers.get("X-Hunter-Token", "")
         if supplied:
             return supplied
-        if method in ("GET", "HEAD"):
+        if method in ("GET", "HEAD") and path in _QUERY_TOKEN_PATHS:
             return query.get("token", [""])[0]
         return ""
 
@@ -430,12 +438,13 @@ class _Handler(BaseHTTPRequestHandler):
         self,
         cfg: HunterConfig,
         method: str,
+        path: str,
         query: dict[str, list[str]],
         ip: str,
         auth: Auth,
     ) -> tuple[Principal | None, bool]:
         """Returns ``(principal, token_locked_out)``."""
-        tok = self._token_supplied(method, query)
+        tok = self._token_supplied(method, path, query)
         if tok:
             if authmod.check_token_lockout(ip):
                 return None, True
@@ -600,21 +609,40 @@ class _Handler(BaseHTTPRequestHandler):
             path, query = url.path, parse_qs(url.query)
             body = self._read_body(method)
 
-            if path == "/healthz":
-                return self._write(Ctx.json(200, {"ok": True}), is_https=is_https)
-            if method == "GET" and (path == "/" or path == "/index.html"):
-                return self._write(self._static("index.html", shell=True), is_https=is_https)
-            if method == "GET" and path.startswith("/static/"):
-                return self._write(self._static(path[len("/static/"):]), is_https=is_https)
+            is_static_path = (
+                path == "/healthz"
+                or path == "/"
+                or path == "/index.html"
+                or path.startswith("/static/")
+            )
             if method == "OPTIONS":
                 allowed = router.allowed_methods(path)
-                if path == "/healthz" or path == "/" or path == "/index.html" or path.startswith("/static/"):
+                if is_static_path:
                     allowed = sorted(set(allowed) | {"GET", "HEAD"})
                 if not allowed:
                     return self._write(Ctx.error(404, "not found"), is_https=is_https)
                 return self._write(
                     Response(204, b"", "text/plain", {"Allow": ", ".join(allowed)}),
                     is_https=is_https,
+                )
+            if is_static_path:
+                if method != "GET":
+                    return self._write(
+                        Ctx.json(
+                            405,
+                            {"error": "method not allowed"},
+                            {"Allow": "GET, HEAD"},
+                        ),
+                        is_https=is_https,
+                    )
+                if path == "/healthz":
+                    return self._write(Ctx.json(200, {"ok": True}), is_https=is_https)
+                if path == "/" or path == "/index.html":
+                    return self._write(
+                        self._static("index.html", shell=True), is_https=is_https
+                    )
+                return self._write(
+                    self._static(path[len("/static/"):]), is_https=is_https
                 )
 
             hit = router.resolve(method, path)
@@ -633,7 +661,7 @@ class _Handler(BaseHTTPRequestHandler):
             fn, perm = hit
             ip = self._client_ip(cfg)
             with Auth(cfg.state_db) as auth:
-                user, tok_locked = self._principal(cfg, method, query, ip, auth)
+                user, tok_locked = self._principal(cfg, method, path, query, ip, auth)
                 if tok_locked:
                     return self._write(
                         Ctx.error(429, "too many invalid token attempts"),
@@ -717,23 +745,24 @@ class _Handler(BaseHTTPRequestHandler):
                             is_https=is_https,
                         )
 
-                ctx = Ctx(
-                    self,
-                    cfg,
-                    method,
-                    path,
-                    query,
-                    body,
-                    user,
-                    ip,
-                    is_https=is_https,
+            ctx = Ctx(
+                self,
+                cfg,
+                method,
+                path,
+                query,
+                body,
+                user,
+                ip,
+                is_https=is_https,
+            )
+            resp = fn(ctx)
+            if not isinstance(resp, Response):
+                resp = Ctx.json(
+                    200, resp if resp is not None else {"ok": True}
                 )
-                resp = fn(ctx)
-                if not isinstance(resp, Response):
-                    resp = Ctx.json(
-                        200, resp if resp is not None else {"ok": True}
-                    )
-                if perm.audit and 200 <= resp.code < 300 and user is not None:
+            if perm.audit and 200 <= resp.code < 300 and user is not None:
+                with Auth(cfg.state_db) as auth:
                     auth.audit(
                         user,
                         f"{method} {path}",
@@ -793,17 +822,25 @@ class _Handler(BaseHTTPRequestHandler):
             st = p.stat()
         except OSError:
             return Ctx.error(404, "not found")
+        ver = ""
+        if shell:
+            from hunter import __version__
+
+            ver = __version__
+        etag_key = f"{rel_norm}:shell:{ver}" if shell else rel_norm
         with _ETAGS_LOCK:
-            cached = _ETAGS.get(rel_norm)
+            cached = _ETAGS.get(etag_key)
             if cached and cached[0] == st.st_mtime_ns:
                 etag = cached[1]
             else:
                 etag = (
                     '"'
-                    + hashlib.md5(f"{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:16]
+                    + hashlib.md5(
+                        f"{st.st_mtime_ns}:{st.st_size}:{ver}".encode()
+                    ).hexdigest()[:16]
                     + '"'
                 )
-                _ETAGS[rel_norm] = (st.st_mtime_ns, etag)
+                _ETAGS[etag_key] = (st.st_mtime_ns, etag)
         if self.headers.get("If-None-Match") == etag:
             return Response(
                 304, b"", "text/plain", {"ETag": etag, "Cache-Control": "no-cache"}
@@ -813,8 +850,7 @@ class _Handler(BaseHTTPRequestHandler):
             ctype = "text/javascript"
         body = p.read_bytes()
         if shell:
-            from hunter import __version__
-            body = body.replace(b"{{VERSION}}", __version__.encode())
+            body = body.replace(b"{{VERSION}}", ver.encode())
         return Response(
             200,
             body,

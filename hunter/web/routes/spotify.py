@@ -5,14 +5,12 @@ import json
 import tempfile
 import threading
 import time
-import urllib.parse as up
 from pathlib import Path
 
 import requests
 
-from hunter import config as config_mod, lock
+from hunter import blocklist, config as config_mod, spotify as spotify_mod
 from hunter.domain import norm_album, norm_artist
-from hunter.http_client import HttpError, HttpSession
 from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
@@ -42,7 +40,6 @@ def overview(ctx: Ctx):
 
 
 @get("/api/spotify/playlists")
-@get("/api/playlists")
 def playlists(ctx: Ctx):
     with common.state(ctx.cfg) as st:
         rows = [dict(r) for r in st.playlists()]
@@ -62,12 +59,11 @@ def playlist_tracks(ctx: Ctx):
         if not meta:
             return ctx.error(404, "unknown playlist")
         tracks = [dict(r) for r in st.sp_playlist_track_rows(pid)]
-        wm = common.want_status_map(
-            st,
+        wm = st.wants_status_map(
             [
                 _want_key(t.get("album_id", ""), t["artist"], t["album"])
                 for t in tracks
-            ],
+            ]
         )
     for t in tracks:
         k = _want_key(t.get("album_id", ""), t["artist"], t["album"])
@@ -162,7 +158,7 @@ def saved_albums(ctx: Ctx):
         else:
             rows, total = st.sp_saved_album_rows(q, sort, 100, offset)
         albums = [dict(r) for r in rows]
-        wm = common.want_status_map(st, [a["album_id"] for a in albums])
+        wm = st.wants_status_map([a["album_id"] for a in albums])
     common.annotate_sp_owned(ctx.cfg, albums, album_key="name")
     for a in albums:
         a["want_key"] = a["album_id"]
@@ -185,12 +181,11 @@ def liked(ctx: Ctx):
         else:
             rows, total = st.sp_liked_rows(q, 100, offset)
         tracks = [dict(r) for r in rows]
-        wm = common.want_status_map(
-            st,
+        wm = st.wants_status_map(
             [
                 _want_key(t.get("album_id", ""), t["artist"], t["album"])
                 for t in tracks
-            ],
+            ]
         )
     for t in tracks:
         k = _want_key(t.get("album_id", ""), t["artist"], t["album"])
@@ -227,9 +222,7 @@ def sp_artists(ctx: Ctx):
             }
         )
     if lib is not None:
-        counts: dict[str, int] = {}
-        for (a, _b), rows_ in lib._by_key.items():
-            counts[a] = counts.get(a, 0) + len(rows_)
+        counts = lib.artist_album_counts()
         for o in out:
             o["library_albums"] = counts.get(norm_artist(o["name"]), 0)
     return ctx.json(200, {"artists": out})
@@ -263,10 +256,9 @@ def sync(ctx: Ctx):
     from hunter import spsync
 
     ignore_cd = ctx.bb("ignore_cooldown")
-    sync_lock_path = cfg.state_dir / "sp_sync.lock"
 
     with _SYNC_LOCK:
-        locked = lock.is_locked(sync_lock_path)
+        locked = spsync.is_sync_busy(cfg)
         if ctx.bb("reset") and locked:
             return ctx.error(409, "sync is currently running — wait before resetting")
         with common.state(cfg) as st:
@@ -317,7 +309,7 @@ def request(ctx: Ctx):
     ):
         source = "request"
     skipped_rows: list[dict] = []
-    added = 0
+    added = blocked = 0
     with common.state(cfg) as st:
         for it in items:
             if not isinstance(it, dict):
@@ -326,13 +318,16 @@ def request(ctx: Ctx):
             album = str(it.get("album", "")).strip()
             if not artist or not album:
                 continue
+            if blocklist.is_blocked(artist, cfg):
+                blocked += 1
+                continue
             key = _want_key(str(it.get("album_id", "")).strip(), artist, album)
             try:
-                total = int(it.get("album_total") or it.get("total_tracks") or 0) or None
+                total = max(0, int(it.get("album_total") or it.get("total_tracks") or 0)) or None
             except (TypeError, ValueError):
                 total = None
             try:
-                year = int(it.get("year") or 0)
+                year = max(0, int(it.get("year") or 0))
             except (TypeError, ValueError):
                 year = 0
             if not force:
@@ -347,7 +342,7 @@ def request(ctx: Ctx):
                         }
                     )
                     continue
-            if st.upsert_want(key, artist, album, year, total, source, resurrect=True):
+            if st.upsert_want(key, artist, album, year, total, source, resurrect=True, cfg=cfg):
                 added += 1
                 st.log_event("request", artist, album, "spotify pick via ui")
     if added:
@@ -363,6 +358,7 @@ def request(ctx: Ctx):
         {
             "added": added,
             "skipped_owned": len(skipped_rows),
+            "skipped_blocked": blocked,
             "skipped": skipped_rows[:20],
         },
     )
@@ -514,10 +510,9 @@ def spdc(ctx: Ctx):
             return ctx.error(502, str(exc))
 
     config_mod.save_spotify_token(cfg, {"sp_dc": sp_dc})
-    with common.state(cfg) as st:
-        if ctx.user:
-            with ctx.auth() as a:
-                a.audit(ctx.user, "POST /api/spotify/spdc", f"user={name}", "", ctx.ip)
+    if ctx.user:
+        with ctx.auth() as a:
+            a.audit(ctx.user, "POST /api/spotify/spdc", f"user={name}", "", ctx.ip)
     log.info("spotify connected via sp_dc cookie (user %s)", name)
     common.spawn_pass()
     return ctx.json(200, {"connected": True, "user": name})
@@ -537,44 +532,33 @@ def auth_url(ctx: Ctx):
     cfg = ctx.cfg
     if not cfg.spotify_client_id:
         return ctx.error(400, "save client creds first")
-    q = up.urlencode(
-        {
-            "client_id": cfg.spotify_client_id,
-            "response_type": "code",
-            "redirect_uri": "http://127.0.0.1:8888/callback",
-            "scope": "playlist-read-private playlist-read-collaborative user-library-read",
-        }
-    )
     return ctx.json(
-        200, {"url": f"https://accounts.spotify.com/authorize?{q}"}
+        200, {"url": spotify_mod.oauth_authorize_url(cfg.spotify_client_id)}
     )
 
 
 @post("/api/spotify/exchange", audit=False)
 def exchange(ctx: Ctx):
     cfg = ctx.cfg
-    pasted = ctx.b("url")
-    code = up.parse_qs(up.urlparse(pasted).query).get("code", [""])[0]
+    code = spotify_mod.extract_oauth_code(ctx.b("url"))
     if not code:
         return ctx.error(400, "no ?code= in that URL")
     if not cfg.spotify_client_id or not cfg.spotify_client_secret:
         return ctx.error(400, "save client creds first")
     try:
-        with HttpSession(timeout=30.0, proxy=cfg.spotify_proxy or None) as http:
-            tok = http.post_json(
-                "https://accounts.spotify.com/api/token",
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": "http://127.0.0.1:8888/callback",
-                },
-                auth=(cfg.spotify_client_id, cfg.spotify_client_secret),
-            )
-    except HttpError as exc:
+        tok = spotify_mod.oauth_exchange_code(
+            cfg.spotify_client_id,
+            cfg.spotify_client_secret,
+            code,
+            cfg=cfg,
+            proxy=cfg.spotify_proxy,
+        )
+    except spotify_mod.SpotifyError as exc:
         return ctx.error(502, f"spotify: {exc}")
-    if not isinstance(tok, dict) or not tok.get("refresh_token"):
+    refresh_token = tok.get("refresh_token") if isinstance(tok, dict) else ""
+    if not refresh_token:
         return ctx.error(502, "no refresh_token returned")
-    config_mod.save_spotify_token(cfg, {"refresh_token": tok["refresh_token"]})
+    config_mod.save_spotify_token(cfg, {"refresh_token": refresh_token})
     if ctx.user:
         with ctx.auth() as a:
             a.audit(ctx.user, "POST /api/spotify/exchange", "oauth", "", ctx.ip)
@@ -584,90 +568,41 @@ def exchange(ctx: Ctx):
 
 @post("/api/spotify/disconnect")
 def disconnect(ctx: Ctx):
-    try:
-        ctx.cfg.token_file.unlink()
-    except OSError:
-        pass
-    config_mod.clear_config_cache()
+    config_mod.delete_spotify_token(ctx.cfg)
     return ctx.json(200, {"connected": False})
 
 
 # ---- Navidrome playlists / radio ------------------------------------------
 
-def _owned_nd_playlists(st) -> dict[str, str]:
-    try:
-        raw = json.loads(st.get_meta("nd_playlists", "{}"))
-        return raw if isinstance(raw, dict) else {}
-    except ValueError:
-        return {}
-
-
 @post("/api/make_playlist")
 def make_playlist(ctx: Ctx):
     cfg = ctx.cfg
     name = ctx.b("name")[:80]
-    tracks = ctx.body.get("tracks")
-    if not name or not isinstance(tracks, list) or not tracks or len(tracks) > 300:
+    raw_tracks = ctx.body.get("tracks")
+    if not name or not isinstance(raw_tracks, list) or not raw_tracks or len(raw_tracks) > 300:
         return ctx.error(400, "name + 1-300 tracks required")
     if not cfg.navidrome_user:
         return ctx.error(400, "Navidrome creds not set")
-    from hunter.playlist_sync import SubsonicClient, match_song
-    from hunter.spotify import SpAlbum, SpTrack
+    pairs = [
+        (str(t.get("artist", "")).strip(), str(t.get("title", "")).strip())
+        for t in raw_tracks
+        if isinstance(t, dict) and str(t.get("title", "")).strip()
+    ]
+    from hunter.playlist_sync import create_navidrome_playlist
 
-    song_ids: list[str] = []
-    matched = 0
-    try:
-        with SubsonicClient(
-            cfg.navidrome_url, cfg.navidrome_user, cfg.navidrome_pass
-        ) as sub:
-            existing_multi = sub.playlists_multi()
-            all_ids = existing_multi.get(name, [])
-            with common.state(cfg) as st:
-                owned_pls = _owned_nd_playlists(st)
-                owned_id = owned_pls.get(name)
-                if owned_id and owned_id in all_ids:
-                    existing_id: str | None = owned_id
-                elif all_ids and not ctx.bb("overwrite"):
-                    return ctx.error(
-                        409,
-                        f"playlist {name!r} already exists in Navidrome and was not created by hunter",
-                    )
-                else:
-                    existing_id = all_ids[-1] if all_ids else None
-
-                for t in tracks:
-                    if not isinstance(t, dict):
-                        continue
-                    title = str(t.get("title", "")).strip()
-                    artist = str(t.get("artist", "")).strip()
-                    if not title:
-                        continue
-                    songs = sub.search_songs(f"{title} {artist}") or sub.search_songs(title)
-                    probe = SpTrack(
-                        id="",
-                        title=title,
-                        artist=artist,
-                        duration_s=0,
-                        album=SpAlbum("", "", "", 0, 0),
-                    )
-                    sid = match_song(probe, songs)
-                    if sid:
-                        song_ids.append(sid)
-                        matched += 1
-                if not song_ids:
-                    return ctx.error(
-                        502, "no tracks matched in Navidrome (rescan pending?)"
-                    )
-                new_id = sub.create_or_replace(name, song_ids, existing_id)
-                if not new_id:
-                    new_id = sub.playlists_multi().get(name, [None])[-1]
-                if new_id:
-                    owned_pls[name] = new_id
-                    st.set_meta("nd_playlists", json.dumps(owned_pls))
-    except Exception as exc:                                     # noqa: BLE001
-        return ctx.error(502, f"navidrome: {exc}")
+    res = create_navidrome_playlist(
+        cfg, name, tracks=pairs, overwrite=ctx.bb("overwrite")
+    )
+    if not res.get("ok"):
+        return ctx.error(int(res.get("status", 502)), res.get("error", "navidrome error"))
     return ctx.json(
-        200, {"ok": True, "name": name, "matched": matched, "total": len(tracks)}
+        200,
+        {
+            "ok": True,
+            "name": res["name"],
+            "matched": res["matched"],
+            "total": len(raw_tracks),
+        },
     )
 
 
@@ -679,6 +614,8 @@ def radio(ctx: Ctx):
         return ctx.error(400, "title + artist required")
     if not cfg.audiomuse_token:
         return ctx.error(400, "AudioMuse token not set")
+    if not cfg.navidrome_user:
+        return ctx.error(400, "Navidrome creds not set")
     try:
         resp = requests.get(
             f"{cfg.audiomuse_url}/api/similar_tracks",
@@ -695,25 +632,16 @@ def radio(ctx: Ctx):
     except (requests.RequestException, ValueError) as exc:
         return ctx.error(502, f"AudioMuse: {exc}")
     ids = [
-        s.get("item_id")
+        str(s["item_id"])
         for s in (similar if isinstance(similar, list) else [])
         if isinstance(s, dict) and s.get("item_id")
     ]
     if not ids:
         return ctx.error(502, "no sonic neighbors yet — analysis still running")
-    from hunter.playlist_sync import SubsonicClient
+    from hunter.playlist_sync import create_navidrome_playlist
 
     name = f"Radio · {title[:40]}"
-    try:
-        with SubsonicClient(
-            cfg.navidrome_url, cfg.navidrome_user, cfg.navidrome_pass
-        ) as sub:
-            new_id = sub.create_or_replace(name, ids, sub.playlists().get(name))
-            if new_id:
-                with common.state(cfg) as st:
-                    owned_pls = _owned_nd_playlists(st)
-                    owned_pls[name] = new_id
-                    st.set_meta("nd_playlists", json.dumps(owned_pls))
-    except Exception as exc:                                     # noqa: BLE001
-        return ctx.error(502, f"navidrome: {exc}")
-    return ctx.json(200, {"name": name, "tracks": len(ids)})
+    res = create_navidrome_playlist(cfg, name, song_ids=ids, overwrite=True)
+    if not res.get("ok"):
+        return ctx.error(int(res.get("status", 502)), res.get("error", "navidrome error"))
+    return ctx.json(200, {"name": res["name"], "tracks": res["matched"]})

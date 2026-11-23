@@ -1561,20 +1561,22 @@ def pulse_counts(cfg: HunterConfig) -> dict[str, Any]:
     conn = connect(cfg)
     try:
         conn.execute("BEGIN")
+        now = time.time()
         albums_n = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
-        items_n, lossless_n = conn.execute(
-            f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END), 0)"
-            f" FROM items i"
+        items_n, lossless_n, a24, a7 = conn.execute(
+            f"SELECT COUNT(*),"
+            f"       COALESCE(SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END), 0),"
+            f"       COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0),"
+            f"       COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0)"
+            f" FROM items i",
+            (now - 86_400, now - 604_800),
         ).fetchone()
-        recent_items = conn.execute(
-            "SELECT COUNT(*) FROM items WHERE added > ?",
-            (time.time() - 86_400,),
-        ).fetchone()[0]
         return {
             "albums": int(albums_n or 0),
             "items": int(items_n or 0),
             "lossless_pct": round(100.0 * (lossless_n or 0) / items_n, 1) if items_n else 0.0,
-            "added_24h": int(recent_items or 0),
+            "added_24h": int(a24 or 0),
+            "added_7d": int(a7 or 0),
         }
     finally:
         conn.close()

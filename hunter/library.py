@@ -250,6 +250,13 @@ class BeetsLibrary:
         key = (norm_artist(artist), norm_album(album))
         return bool(key[0] and key[1] and key in self._by_key)
 
+    def artist_album_counts(self) -> dict[str, int]:
+        """Map normalized artist name -> total album row count in beets."""
+        counts: dict[str, int] = {}
+        for (a, _b), rows_ in self._by_key.items():
+            counts[a] = counts.get(a, 0) + len(rows_)
+        return counts
+
     def album_coverage(
         self,
         album_id: int,

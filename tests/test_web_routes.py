@@ -266,7 +266,7 @@ class WebRoutesTest(unittest.TestCase):
 
     def test_library_modify_confirm_count_gate(self) -> None:
         with (
-            mock.patch("hunter.web.routes.beets.DockerClient") as m_docker,
+            mock.patch("hunter.web.routes.library.DockerClient") as m_docker,
             mock.patch.object(common, "jobs") as m_jobs,
         ):
             m_jobs.return_value.start_beets.return_value = {"ok": True, "job": {"id": "job-small"}}
@@ -320,7 +320,14 @@ class WebRoutesTest(unittest.TestCase):
             self.assertEqual(m_jobs.return_value.start_beets.call_count, 2)
 
     def test_library_beet_apostrophe_quoting(self) -> None:
-        with mock.patch.object(common, "jobs") as m_jobs:
+        with (
+            mock.patch("hunter.web.routes.library.DockerClient") as m_docker,
+            mock.patch.object(common, "jobs") as m_jobs,
+        ):
+            m_docker.return_value.exec_run.return_value = {
+                "exit_code": 0,
+                "output": "1\tGuns N' Roses\tAppetite\n__HUNTER_COUNT__=1\n",
+            }
             m_jobs.return_value.start_beets.return_value = {"ok": True, "job": {"id": "job-gnr"}}
             st_code, _, raw = _http_req(
                 self.port,
@@ -584,21 +591,25 @@ class WebRoutesTest(unittest.TestCase):
         fake_ok.headers = {"Content-Type": "image/jpeg"}
         fake_ok.iter_content.return_value = [b"\xff\xd8\xff\xe0TESTJPEG"]
 
-        with mock.patch.object(common.ART_SESSION, "get", side_effect=[fake_bad_ct, fake_bad_ct]):
+        fake_sess = mock.MagicMock()
+        fake_sess.get.side_effect = [fake_bad_ct, fake_bad_ct]
+        with mock.patch.object(common.ART_CLIENT, "session", return_value=fake_sess):
             st_bad_ct, _, _ = _http_req(
                 self.port, "GET", f"/api/art/{rgid}", headers=self._view_headers()
             )
             self.assertEqual(st_bad_ct, 404)
 
         (self.state_dir / "art" / f"{rgid}.miss").unlink(missing_ok=True)
-        with mock.patch.object(common.ART_SESSION, "get", side_effect=[fake_big, fake_big]):
+        fake_sess.get.side_effect = [fake_big, fake_big]
+        with mock.patch.object(common.ART_CLIENT, "session", return_value=fake_sess):
             st_big, _, _ = _http_req(
                 self.port, "GET", f"/api/art/{rgid}", headers=self._view_headers()
             )
             self.assertEqual(st_big, 404)
 
         (self.state_dir / "art" / f"{rgid}.miss").unlink(missing_ok=True)
-        with mock.patch.object(common.ART_SESSION, "get", side_effect=[fake_ok]):
+        fake_sess.get.side_effect = [fake_ok]
+        with mock.patch.object(common.ART_CLIENT, "session", return_value=fake_sess):
             st_ok, hdrs_ok, raw_ok = _http_req(
                 self.port, "GET", f"/api/art/{rgid}", headers=self._view_headers()
             )
@@ -677,6 +688,7 @@ class WebRoutesTest(unittest.TestCase):
             "id": "b1",
             "title": "Test",
             "status": "ready",
+            "requested_by": "view1",
             "path": str(zip_path),
         }
         with (

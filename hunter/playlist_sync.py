@@ -261,7 +261,7 @@ def create_navidrome_playlist(
                     "status": 409,
                     "error": (
                         f"playlist {clean_name!r} already exists in Navidrome "
-                        "and wasn't created by hunter — pass overwrite=true to replace it"
+                        "and was not created by hunter — pass overwrite=true to replace it"
                     ),
                 }
 
@@ -307,16 +307,19 @@ def create_navidrome_playlist(
     except SubsonicError as exc:
         return {"ok": False, "status": 502, "error": f"navidrome: {exc}"}
 
-    if not existing_id and new_id:
+    if new_id:
         with HunterState(cfg.state_db) as st:
             fresh_owned = _load_owned_playlists(st)
             fresh_owned[clean_name] = new_id
             _save_owned_playlists(st, fresh_owned)
 
+    total_in = len(song_ids) if song_ids is not None else len(tracks or ())
     return {
         "ok": True,
         "name": clean_name,
         "matched": len(resolved_ids),
+        "tracks": len(resolved_ids),
+        "total": total_in,
         "missed": len(missed),
         "missed_sample": missed[:15],
         "replaced": bool(existing_id),

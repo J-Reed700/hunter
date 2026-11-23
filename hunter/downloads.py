@@ -213,7 +213,9 @@ def bundle_file_info(cfg: HunterConfig, bundle: dict) -> tuple[Path, str] | None
     if not bid or bundle.get("status") != "ready":
         return None
     dl_dir = _dir(cfg)
-    p = domain.resolve_under(dl_dir, dl_dir / f"{bid}.zip")
+    raw = bundle.get("path")
+    cand = Path(raw) if isinstance(raw, str) and raw else (dl_dir / f"{bid}.zip")
+    p = domain.resolve_under(dl_dir, cand)
     if p is None or not p.is_file():
         return None
     fname = f"{_safe(bundle.get('title') or bid)}.zip"

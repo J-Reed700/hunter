@@ -891,44 +891,47 @@ def count_matches(
 def guard_mutation(
     cfg: HunterConfig,
     docker: DockerClient,
-    cmd: beetcmd.Cmd,
-    qtoks: list[str],
-    album: bool,
     argv: list[str],
-    confirm_count: int | None,
-) -> tuple[int | None, tuple[int, dict[str, Any]] | None]:
+    *,
+    allow_all: bool = False,
+    confirm_count: int = -1,
+) -> tuple[int, dict[str, Any]] | None:
     """Enforce blast-radius cap and confirm_count for mutating beet commands.
 
-    Returns ``(count, None)`` when allowed to proceed, or
-    ``(count, (http_status, error_payload))`` when blocked.
+    Returns ``None`` when allowed to proceed, or ``(http_status, error_payload)``
+    when blocked. Commands with ``cmd.query == "none"`` (e.g. ``splupdate``)
+    skip the ``beet ls`` count check.
     """
+    cmd, qtoks, album = beetcmd.query_of(argv)
+    if cmd is None:
+        return 400, {"error": "unknown command"}
     if cmd.cls != "mutate" or cmd.query == "none":
-        return None, None
+        return None
     try:
         count, sample, rc = count_matches(cfg, docker, qtoks, album)
     except DockerError as exc:
-        return None, (502, {"error": f"preview count failed: {exc}"})
-    if rc != 0:
-        return None, (502, {"error": f"preview count failed (exit {rc})"})
+        return 502, {"error": f"beet preview count failed: {exc}"}
+    if rc not in (0, None):
+        return 502, {"error": f"beet preview count failed (exit {rc})"}
     if count == 0:
-        return 0, (400, {"error": "query matches 0 items — nothing to do"})
-    if count > beetcmd.HARD_MAX:
-        return count, (
+        return 400, {"error": "query matches nothing — refusing to run"}
+    if count > beetcmd.HARD_MAX and not allow_all:
+        return (
             400,
-            {"error": f"matches {count} ({'albums' if album else 'tracks'}), above hard cap {beetcmd.HARD_MAX}"},
+            {"error": f"query matches {count} rows (> {beetcmd.HARD_MAX}); use a narrower query"},
         )
     if beetcmd.needs_confirm(cmd, qtoks, count, argv) and confirm_count != count:
-        return count, (
+        return (
             409,
             {
-                "error": f"confirmation required: {count} {'albums' if album else 'tracks'}",
+                "error": "confirm_count required",
                 "needs_confirm": True,
                 "count": count,
                 "album": album,
                 "sample": sample[:20],
             },
         )
-    return count, None
+    return None
 
 
 def load_schedule(cfg: HunterConfig | None = None) -> list[dict]:

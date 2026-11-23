@@ -3,11 +3,10 @@ from __future__ import annotations
 
 import shlex
 
-from hunter import beetcmd, blocklist, domain, libops, libquery
-from hunter.dockerctl import DockerClient, DockerError
+from hunter import beetcmd, beetsops, blocklist, domain, libops, libquery
+from hunter.dockerctl import DockerClient
 from hunter.web import common
 from hunter.web.router import get, post
-from hunter.web.routes import beets as beets_routes
 from hunter.web.server import Ctx
 
 log = common.log
@@ -23,6 +22,7 @@ def _album_filters(ctx: Ctx) -> dict:
         q=ctx.q("q"),
         artist=ctx.q("artist"),
         genre=ctx.q("genre"),
+        label=ctx.q("label"),
         year=ctx.qi("year", 0) or None,
         decade=ctx.qi("decade", 0) or None,
         year_from=ctx.qi("year_from", 0) or None,
@@ -82,7 +82,7 @@ def _attach_wants(ctx: Ctx, rows: list[dict]) -> None:
         if r.get("rgid"):
             keys.append(f"request:rg:{r['rgid']}")
     with common.state(ctx.cfg) as st:
-        wm = common.want_status_map(st, keys)
+        wm = st.wants_status_map(keys)
     for r in rows:
         r["wants"] = {
             k: v
@@ -101,10 +101,13 @@ def album(ctx: Ctx):
     if not res:
         return ctx.error(404, "unknown album")
     _attach_wants(ctx, [res])
-    jobs = common.jobs(ctx.cfg)
-    res["jobs"] = [
-        j for j in jobs.list(limit=30) if j["meta"].get("album_id") == res["id"]
-    ][:6]
+    if ctx.user and ctx.user.can("operator"):
+        jobs = common.jobs(ctx.cfg)
+        res["jobs"] = [
+            j for j in jobs.list(limit=30) if j["meta"].get("album_id") == res["id"]
+        ][:6]
+    else:
+        res["jobs"] = []
     return ctx.json(200, res)
 
 
@@ -183,11 +186,6 @@ def artists(ctx: Ctx):
     return ctx.json(200, res)
 
 
-@get("/api/library_artists")
-def library_artists_compat(ctx: Ctx):
-    return artists(ctx)
-
-
 @get("/api/library/artists/names")
 def artist_names(ctx: Ctx):
     return ctx.json(
@@ -237,11 +235,6 @@ def artist(ctx: Ctx):
     return ctx.json(200, res)
 
 
-@get("/api/library_artist")
-def library_artist_compat(ctx: Ctx):
-    return artist(ctx)
-
-
 def _track_filters(ctx: Ctx) -> dict:
     return dict(
         q=ctx.q("q"),
@@ -259,7 +252,6 @@ def _track_filters(ctx: Ctx) -> dict:
 
 
 @get("/api/library/tracks")
-@get("/api/library_tracks")
 def tracks(ctx: Ctx):
     return ctx.json(
         200,
@@ -350,6 +342,8 @@ def want(ctx: Ctx):
     a = libquery.album(cfg, album_id)
     if not a:
         return ctx.error(404, "unknown album")
+    if blocklist.is_blocked(a["artist"], cfg):
+        return ctx.error(409, f"artist {a['artist']!r} is on the import blocklist")
     total = a.get("tracktotal") or ctx.bi("expected") or None
     if kind == "gapfill" and total and a["tracks"] >= total:
         return ctx.json(
@@ -365,6 +359,7 @@ def want(ctx: Ctx):
             total,
             kind,
             resurrect=True,
+            cfg=cfg,
         )
         if added:
             st.set_priority(key, domain.PRIORITY_OPERATOR)
@@ -415,23 +410,26 @@ def beet_action(ctx: Ctx):
     opts: dict = {}
     if ctx.bb("force"):
         opts["-f"] = True
-    album_mode = action in (
-        "fetchart",
-        "embedart",
-        "clearart",
-        "lastgenre",
-        "replaygain",
-    )
-    if album_mode and action in ("lastgenre", "replaygain"):
+    if not item_id and action in ("lastgenre", "replaygain"):
         opts["-a"] = True
     try:
         argv = beetcmd.build(action, query=query, options=opts, apply=True)
     except beetcmd.PolicyError as exc:
         return ctx.error(400, str(exc))
+    if cfg.beets_console_available:
+        err = beetsops.guard_mutation(
+            cfg,
+            DockerClient(cfg.docker_sock),
+            argv,
+            allow_all=ctx.bb("allow_all"),
+            confirm_count=ctx.bi("confirm_count", -1),
+        )
+        if err is not None:
+            return ctx.json(err[0], err[1])
     res = common.jobs(cfg).start_beets(
         kind="beet",
         title=f"{action} · {label}",
-        argv=beetcmd.BEET_ARGV + argv,
+        argv=beetcmd.beet_argv(cfg) + argv,
         mode="apply",
         meta={
             "album_id": album_id or None,
@@ -489,37 +487,21 @@ def modify(ctx: Ctx):
     if apply:
         if not cfg.beets_console_available:
             return ctx.error(503, "docker socket not mounted")
-        cmd, qtoks, alb = beetcmd.query_of(argv)
-        if cmd is None:
-            return ctx.error(400, "unknown command")
-        try:
-            count, _sample, rc = beets_routes.count_matches(ctx, qtoks, alb)
-        except DockerError as exc:
-            return ctx.error(502, str(exc))
-        if rc not in (0, None):
-            return ctx.error(502, f"beet preview count failed (exit {rc})")
-        if count == 0:
-            return ctx.error(400, "query matches nothing — refusing to run")
-        if count > beetcmd.HARD_MAX and not ctx.bb("allow_all"):
-            return ctx.error(
-                400,
-                f"query matches {count} rows (> {beetcmd.HARD_MAX}); use a narrower query",
-            )
-        if beetcmd.needs_confirm(cmd, qtoks, count, argv) and ctx.bi("confirm_count", -1) != count:
-            return ctx.json(
-                409,
-                {
-                    "error": "confirm_count required",
-                    "count": count,
-                    "needs_confirm": True,
-                },
-            )
+        err = beetsops.guard_mutation(
+            cfg,
+            DockerClient(cfg.docker_sock),
+            argv,
+            allow_all=ctx.bb("allow_all"),
+            confirm_count=ctx.bi("confirm_count", -1),
+        )
+        if err is not None:
+            return ctx.json(err[0], err[1])
 
     label = query if len(query) < 60 else query[:57] + "…"
     res = common.jobs(cfg).start_beets(
         kind="beet",
         title=f"modify · {label}",
-        argv=beetcmd.BEET_ARGV + argv,
+        argv=beetcmd.beet_argv(cfg) + argv,
         mode="apply" if apply else "dry-run",
         meta={
             "album_id": album_id or None,
@@ -552,27 +534,8 @@ def remove_plan(ctx: Ctx):
     plan = libops.removal_plan(ctx.cfg, artists_t, album_ids_t, item_ids_t)
     with common.state(ctx.cfg) as st:
         names = plan["targets"]["artists"]
-        all_aids = plan.get("all_album_ids") or [
-            a["album_id"] for a in plan["albums"] if a.get("full") and a.get("album_id")
-        ]
-        keys = [
-            f"{k}:beets:{aid}"
-            for aid in all_aids
-            if aid
-            for k in ("gapfill", "upgrade")
-        ]
-        keys += [f"recovery:a{aid}" for aid in all_aids if aid]
-        all_rgids = plan.get("all_rgids")
-        if all_rgids is None:
-            all_rgids = [a.get("rgid") for a in plan["albums"] if a.get("rgid")]
-        for rgid in all_rgids:
-            if rgid:
-                keys.append(f"request:rg:{rgid}")
-                keys.append(f"release:rg:{rgid}")
-        plan["open_wants"] = (
-            st.open_wants_count_for_artists(names)
-            + st.open_wants_count_for_keys(keys)
-        )
+        keys = libops.plan_park_keys(plan)
+        plan["open_wants"] = len(st.wants_for_artists_and_keys(names, keys))
         low = {n.casefold() for n in names}
         plan["followed"] = [
             r["name"]
@@ -659,11 +622,12 @@ def remove(ctx: Ctx):
 
 @get("/api/library/removals")
 def removals(ctx: Ctx):
+    is_op = bool(ctx.user and ctx.user.can("operator"))
     return ctx.json(
         200,
         {
             "removals": libops.removals(ctx.cfg, ctx.qi("limit", 60, 1, 200)),
-            "root": str(libops.prune_root(ctx.cfg)),
+            "root": str(libops.prune_root(ctx.cfg)) if is_op else "",
         },
     )
 
@@ -673,12 +637,15 @@ def removal(ctx: Ctx):
     res = libops.removal(ctx.cfg, ctx.q("id"))
     if not res:
         return ctx.error(404, "unknown removal")
-    jobs = common.jobs(ctx.cfg)
-    res["jobs"] = [
-        j
-        for j in jobs.list(limit=60, kind="library")
-        if j["meta"].get("removal") == res["id"]
-    ][:5]
+    if ctx.user and ctx.user.can("operator"):
+        jobs = common.jobs(ctx.cfg)
+        res["jobs"] = [
+            j
+            for j in jobs.list(limit=60, kind="library")
+            if j["meta"].get("removal") == res["id"]
+        ][:5]
+    else:
+        res["jobs"] = []
     return ctx.json(200, res)
 
 

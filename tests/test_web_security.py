@@ -439,7 +439,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(router.resolve("GET", "/api/auth/me")[1].role, "public")  # type: ignore[index]
 
     def test_common_reap_children_and_user_agent(self):
-        self.assertNotIn("jreed", common.ART_SESSION.headers["User-Agent"])
+        self.assertNotIn("jreed", common.ART_CLIENT.user_agent())
         proc = mock.Mock()
         proc.poll.return_value = 0
         with common._children_lock:

@@ -67,9 +67,15 @@ def follow_by_name(ctx: Ctx):
         added = st.follow_artist(hit["id"], hit["name"])
         if added:
             st.log_event("follow", hit["name"], "", "from library via ui")
+        row = st.artist_by_mbid(hit["id"])
     return ctx.json(
         200,
-        {"added": added, "id": hit["id"], "name": hit["name"], "want_types": "album,ep"},
+        {
+            "added": added,
+            "id": hit["id"],
+            "name": hit["name"],
+            "want_types": (row["want_types"] if row else "album,ep") or "album,ep",
+        },
     )
 
 
@@ -124,6 +130,7 @@ def canon(ctx: Ctx):
         return ctx.error(400, "name or mbid required")
     from hunter import listenbrainz as lb
 
+    allow_refresh = ctx.q("refresh") == "1" and bool(ctx.user and ctx.user.can("operator"))
     with common.state(cfg) as st:
         if not mbid:
             try:
@@ -133,13 +140,23 @@ def canon(ctx: Ctx):
                 pass
         if not mbid:
             return ctx.json(200, {"canon": [], "note": "no MusicBrainz artist match"})
-        if st.canon_age(mbid) > 604_800 or ctx.q("refresh") == "1":
+        if not name:
+            followed_row = st.artist_by_mbid(mbid)
+            if followed_row:
+                name = followed_row["name"] or ""
+        if st.canon_age(mbid) > 604_800 or allow_refresh:
+            if not name:
+                try:
+                    art = mb.mb_get(f"/artist/{mbid}", {})
+                    name = str(art.get("name") or "")
+                except (requests.RequestException, ValueError, mb.MBUnavailable):
+                    pass
             try:
                 rgs = mb.artist_release_groups(mbid)
             except (requests.RequestException, ValueError, mb.MBUnavailable):
                 rgs = []
             rgs = [r for r in rgs if not r.get("secondary")]
-            scores, complete = lb.canon_scores_checked(mbid, rgs)
+            scores, complete = lb.canon_scores_checked(rgs, cfg=cfg)
             if complete:
                 with st.transaction():
                     for c in scores:
@@ -153,16 +170,18 @@ def canon(ctx: Ctx):
                             "",
                         )
         rows = st.canon_for_artist(mbid)
-        wm = common.want_status_map(st, [f"request:rg:{r['rgid']}" for r in rows])
+        if not name and rows:
+            name = rows[0]["artist"] or ""
+        wm = st.wants_status_map([f"request:rg:{r['rgid']}" for r in rows])
 
     lib = common.library(cfg)
     out = []
     for r in rows:
         owned, have, album_id = False, 0, None
         if lib is not None:
-            res = lib.rg_owned(r["rgid"], None, cfg.owned_coverage)
-            if res is None:
-                res = lib.owned(name, r["album"], None, cfg.owned_coverage)
+            res = lib.lookup_owned(
+                name, r["album"], rgid=r["rgid"], min_coverage=cfg.owned_coverage
+            )
             owned, have, album_id = res.owned, res.item_count, res.album_id
         out.append(
             {

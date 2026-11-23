@@ -64,11 +64,6 @@ def resolve(method: str, path: str) -> tuple[Callable, Perm] | None:
     return None
 
 
-def dispatch(method: str, path: str) -> Callable | None:
-    hit = resolve(method, path)
-    return hit[0] if hit is not None else None
-
-
 def allowed_methods(path: str) -> list[str]:
     """Return sorted HTTP methods registered for *path*."""
     methods: set[str] = set()
@@ -114,7 +109,6 @@ def routes() -> list[tuple[str, str, str]]:
 
 __all__ = [
     "allowed_methods",
-    "dispatch",
     "get",
     "perm_of",
     "post",

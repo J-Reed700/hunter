@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import threading
 import time
 
@@ -13,6 +14,8 @@ from hunter.web.server import Ctx
 
 log = common.log
 _BACKUP_LOCK = threading.Lock()
+_LAST_BACKUP_MONO = 0.0
+_BACKUP_COOLDOWN_S = 15.0
 
 
 @get("/api/automation", role="operator")
@@ -139,7 +142,7 @@ def program(ctx: Ctx):
 
         from hunter import pipeline
 
-        limit = ctx.bi("limit", 0)
+        limit = max(0, ctx.bi("limit", 0))
         if prog == "gapfill":
             new = pipeline.seed_gaps(cfg, st, limit=limit, apply=True)
         else:
@@ -166,12 +169,6 @@ def peers(ctx: Ctx):
         200,
         {"banned": banned, "stats": stats[:200], "strikes": ctx.cfg.peer_ban_strikes},
     )
-
-
-@get("/api/banned", role="operator")
-def banned(ctx: Ctx):
-    with common.state(ctx.cfg) as st:
-        return ctx.json(200, {"peers": [dict(r) for r in st.banned_peer_rows()]})
 
 
 @post("/api/ban")
@@ -223,11 +220,21 @@ def backups(ctx: Ctx):
 
 @post("/api/backups/hunter")
 def backup_hunter(ctx: Ctx):
+    global _LAST_BACKUP_MONO
     cfg = ctx.cfg
     d = cfg.state_dir / "backups"
-    d.mkdir(parents=True, exist_ok=True)
     target = d / f"hunter.db.{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}.manual"
     with _BACKUP_LOCK:
-        db.backup_sqlite(cfg.state_db, target)
-        db.prune_backups(d, keep_days=14)
+        now = time.monotonic()
+        if _LAST_BACKUP_MONO and (now - _LAST_BACKUP_MONO) < _BACKUP_COOLDOWN_S:
+            rem = int(_BACKUP_COOLDOWN_S - (now - _LAST_BACKUP_MONO)) + 1
+            return ctx.error(429, f"backup recently created — wait {rem}s")
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            db.backup_sqlite(cfg.state_db, target)
+            db.prune_backups(d, keep_days=14)
+        except (sqlite3.Error, OSError) as exc:
+            log.warning("manual backup failed: %s", exc)
+            return ctx.error(500, f"backup failed: {exc}")
+        _LAST_BACKUP_MONO = time.monotonic()
     return ctx.json(200, {"backup": target.name})

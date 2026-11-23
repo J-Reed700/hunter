@@ -38,22 +38,20 @@ def _handle_signal(_signum: int, _frame: Any) -> None:
 
 def _reap_zombies(exclude_pids: set[int] | None = None) -> None:
     """Peek exited children via waitid(WNOWAIT) and reap only untracked orphans,
-    never stealing exit codes from UI-launched local jobs in jobs._local_procs."""
+    never stealing exit codes from UI-launched local jobs or spawned passes."""
     skip = set(exclude_pids or ())
     try:
         from hunter import jobs as _jobs
 
-        fn = getattr(_jobs, "tracked_local_pids", None)
-        if callable(fn):
-            skip |= set(fn())
-        else:
-            skip |= {
-                p.pid
-                for p in getattr(_jobs, "_local_procs", {}).values()
-                if p.poll() is None or p.returncode is None
-            }
-    except Exception:                               # noqa: BLE001
-        pass
+        skip |= set(_jobs.tracked_local_pids())
+    except Exception as exc:                        # noqa: BLE001
+        log.debug("tracked_local_pids lookup failed: %s", exc)
+    try:
+        from hunter.web import common as _web_common
+
+        skip |= set(_web_common.tracked_child_pids())
+    except Exception as exc:                        # noqa: BLE001
+        log.debug("tracked_child_pids lookup failed: %s", exc)
 
     while True:
         try:
@@ -86,6 +84,28 @@ def _should_alert(streak: int, threshold: int) -> bool:
     return streak >= threshold and (streak == threshold or (streak - threshold) % 3 == 0)
 
 
+def _terminate_proc(
+    proc: subprocess.Popen[bytes], grace_s: float, *, force_rc: int | None = None
+) -> int:
+    """Send SIGTERM, wait up to *grace_s*, then escalate to SIGKILL."""
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    grace_end = time.monotonic() + grace_s
+    while time.monotonic() < grace_end:
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        time.sleep(0.2)
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    waited = proc.wait()
+    return waited if force_rc is None else force_rc
+
+
 def _wait_for_pass(proc: subprocess.Popen[bytes], budget_s: float) -> int:
     """Wait for *proc* in 0.5s slices, forwarding SIGTERM on shutdown or timeout."""
     deadline = time.monotonic() + budget_s
@@ -96,41 +116,14 @@ def _wait_for_pass(proc: subprocess.Popen[bytes], budget_s: float) -> int:
 
         if _stop_event.is_set():
             log.info("shutdown requested — terminating active pass child")
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-            grace_end = time.monotonic() + STOP_GRACE
-            while time.monotonic() < grace_end:
-                rc = proc.poll()
-                if rc is not None:
-                    return rc
-                time.sleep(0.2)
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            return proc.wait()
+            return _terminate_proc(proc, STOP_GRACE)
 
         if time.monotonic() >= deadline:
             log.error("pass exceeded %ss — sending SIGTERM", int(budget_s))
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-            grace_end = time.monotonic() + TIMEOUT_GRACE
-            while time.monotonic() < grace_end:
-                rc = proc.poll()
-                if rc is not None:
-                    return rc
-                time.sleep(0.2)
-            log.error("pass ignored SIGTERM — SIGKILL")
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            proc.wait()
-            return -9
+            rc = _terminate_proc(proc, TIMEOUT_GRACE, force_rc=-9)
+            if rc == -9:
+                log.error("pass ignored SIGTERM — SIGKILL")
+            return rc
 
         _stop_event.wait(0.5)
 
@@ -155,12 +148,12 @@ def run_forever() -> int:
     except Exception as exc:                       # noqa: BLE001
         log.warning("download startup recovery failed: %s", exc)
 
-    from hunter.webui import start_ui
+    from hunter import libops
+    from hunter.jobs import Jobs
+    from hunter.web.server import start_ui
 
     http_server = start_ui(cfg)
-
-    from hunter import libops  # noqa: F401
-    from hunter.jobs import Jobs
+    job_finalizers = {"library": libops.on_library_job}
 
     log.info(
         "hunter %s starting | interval=%ss apply=%s spotify=%s slskd=%s",
@@ -184,11 +177,16 @@ def run_forever() -> int:
                 proc = subprocess.Popen([sys.executable, "-m", "hunter.cli", "pass"])
             except OSError as exc:
                 log.error("failed to spawn pass: %s", exc)
+                lock_busy_streak = 0
                 consecutive_failures += 1
                 rc = None
             else:
                 budget = cfg.pass_deadline + KILL_GRACE
                 rc = _wait_for_pass(proc, float(budget))
+                if _stop_event.is_set() and rc not in (0, 3):
+                    log.info("pass interrupted by shutdown (rc=%s)", rc)
+                    _reap_zombies()
+                    break
                 if rc == 3:
                     lock_busy_streak += 1
                 else:
@@ -216,7 +214,7 @@ def run_forever() -> int:
                 },
             )
             try:
-                Jobs(cfg).refresh()
+                Jobs(cfg, finalizers=job_finalizers).refresh()
                 last_job_refresh = time.monotonic()
             except Exception as exc:               # noqa: BLE001
                 log.warning("job refresh failed: %s", exc)
@@ -243,7 +241,7 @@ def run_forever() -> int:
                 _reap_zombies()
                 if time.monotonic() - last_job_refresh >= JOB_REFRESH_EVERY:
                     try:
-                        Jobs(cfg).refresh()
+                        Jobs(cfg, finalizers=job_finalizers).refresh()
                     except Exception as exc:       # noqa: BLE001
                         log.warning("job refresh failed: %s", exc)
                     last_job_refresh = time.monotonic()
