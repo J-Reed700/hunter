@@ -41,33 +41,29 @@ def path(cfg: Any = None) -> Path:
     if cfg is not None and getattr(cfg, "beets_automation_dir", None) is not None:
         base = Path(cfg.beets_automation_dir)
     else:
-        base = Path(os.environ.get("HUNTER_BEETS_AUTOMATION") or "/beets-automation")
+        raw = (os.environ.get("HUNTER_BEETS_AUTOMATION") or "").strip()
+        base = Path(raw or "/beets-automation")
     return base / "lib" / "artist_blocklist.txt"
-
-
-blocklist_path = path
 
 
 def snapshot(cfg: Any = None) -> BlocklistSnapshot:
     global _cache_key, _cache_snap
     p = path(cfg)
     p_str = str(p)
-    try:
-        st = p.stat()
-    except FileNotFoundError:
-        with _lock:
+    with _lock:
+        try:
+            st = p.stat()
+        except FileNotFoundError:
             if _cache_key is not None and _cache_key[0] == p_str:
                 _cache_key = None
                 _cache_snap = None
-        return _EMPTY
-    except OSError:
-        with _lock:
+            return _EMPTY
+        except OSError:
             if _cache_key is not None and _cache_key[0] == p_str and _cache_snap is not None:
                 return _cache_snap
-        return _EMPTY
+            return _EMPTY
 
-    stat_key = (p_str, st.st_mtime_ns, st.st_size, st.st_ino)
-    with _lock:
+        stat_key = (p_str, st.st_mtime_ns, st.st_size, st.st_ino)
         if _cache_key == stat_key and _cache_snap is not None:
             return _cache_snap
         try:
@@ -133,7 +129,6 @@ __all__ = [
     "BlocklistSnapshot",
     "available",
     "blocked_set",
-    "blocklist_path",
     "entries",
     "invalidate",
     "is_blocked",

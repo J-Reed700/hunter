@@ -7,6 +7,7 @@ closed DB handle.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -15,9 +16,72 @@ from pathlib import Path
 from typing import Any
 
 from hunter.db import open_readonly_db
-from hunter.domain import LOSSLESS_FORMATS, norm_album, norm_artist, normalize
+from hunter.domain import LOSSLESS_SQL, norm_album, norm_artist
 
-_LOSSLESS_SQL = "(" + ",".join(f"'{fmt}'" for fmt in sorted(LOSSLESS_FORMATS)) + ")"
+log = logging.getLogger("hunter.library")
+
+
+def has_items_column(conn: sqlite3.Connection, col: str) -> bool:
+    """Return True when *col* exists on the beets ``items`` table."""
+    return col in {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+
+
+def effective_track_total(
+    known_total: int,
+    item_count: int,
+    present_discs: int,
+    disctotal: int,
+) -> int:
+    """Disc-aware expected track total accounting for missing whole discs."""
+    if disctotal > 1 and 0 < present_discs < disctotal:
+        missing_discs = disctotal - present_discs
+        base = known_total if known_total > 0 else item_count
+        per_disc = max(1, round(base / present_discs))
+        return max(known_total, base + missing_discs * per_disc)
+    return known_total
+
+
+def album_totals_cte(has_disctotal: bool) -> str:
+    """SQLite CTE computing per-album ``tracktotal`` across all discs, including
+    an estimate for entirely absent discs when ``disctotal > present_discs``."""
+    if not has_disctotal:
+        return (
+            "WITH disc_totals AS ("
+            "  SELECT album_id, COALESCE(NULLIF(disc, 0), 1) AS d,"
+            "         COALESCE(MAX(tracktotal), 0) AS disc_total"
+            "  FROM items WHERE album_id IS NOT NULL"
+            "  GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)"
+            "), album_totals AS ("
+            "  SELECT album_id, SUM(disc_total) AS tracktotal"
+            "  FROM disc_totals GROUP BY album_id"
+            ")"
+        )
+    return (
+        "WITH disc_totals AS ("
+        "  SELECT album_id, COALESCE(NULLIF(disc, 0), 1) AS d,"
+        "         COUNT(id) AS disc_items,"
+        "         COALESCE(MAX(tracktotal), 0) AS disc_total,"
+        "         COALESCE(MAX(disctotal), 0) AS max_dt"
+        "  FROM items WHERE album_id IS NOT NULL"
+        "  GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)"
+        "), album_disc_agg AS ("
+        "  SELECT album_id,"
+        "         SUM(disc_total) AS known_total,"
+        "         SUM(disc_items) AS item_count,"
+        "         COUNT(*) AS present_discs,"
+        "         MAX(max_dt) AS disctotal"
+        "  FROM disc_totals GROUP BY album_id"
+        "), album_totals AS ("
+        "  SELECT album_id,"
+        "         CASE WHEN disctotal > 1 AND present_discs > 0 AND present_discs < disctotal THEN"
+        "           MAX(known_total,"
+        "               (CASE WHEN known_total > 0 THEN known_total ELSE item_count END)"
+        "               + (disctotal - present_discs)"
+        "                 * MAX(1, CAST(ROUND(1.0 * (CASE WHEN known_total > 0 THEN known_total ELSE item_count END) / present_discs) AS INTEGER)))"
+        "         ELSE known_total END AS tracktotal"
+        "  FROM album_disc_agg"
+        ")"
+    )
 
 
 @dataclass(frozen=True)
@@ -63,7 +127,6 @@ class BeetsLibrary:
         self._albums_by_id: dict[int, tuple[int, int]] = {}
         self._lossless_by_album_id: dict[int, int] = {}
         self._by_key: dict[tuple[str, str], list[tuple[int, int, int]]] = {}
-        self._index = self._by_key  # backwards-compat alias
         self._by_rgid: dict[str, list[tuple[int, int, int]]] = {}
 
         conn = open_readonly_db(db_path, timeout=15.0)
@@ -73,49 +136,24 @@ class BeetsLibrary:
             conn.close()
 
     def _load(self, conn: sqlite3.Connection) -> None:
-        item_cols = {
-            r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()
-        }
-        disctotal_expr = (
-            "COALESCE(MAX(i.disctotal), 0)" if "disctotal" in item_cols else "0"
-        )
+        has_dt = has_items_column(conn, "disctotal")
+        cte = album_totals_cte(has_dt)
         rows = conn.execute(
-            f"WITH disc_totals AS ("
-            f"  SELECT album_id, COALESCE(NULLIF(disc, 0), 1) AS d,"
-            f"         COALESCE(MAX(tracktotal), 0) AS disc_total"
-            f"  FROM items WHERE album_id IS NOT NULL"
-            f"  GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)"
-            f"),"
-            f"album_totals AS ("
-            f"  SELECT album_id, SUM(disc_total) AS tracktotal"
-            f"  FROM disc_totals GROUP BY album_id"
-            f")"
+            f"{cte} "
             f"SELECT a.id, a.albumartist, a.album, a.mb_releasegroupid,"
             f"       COUNT(i.id) AS item_count,"
             f"       COALESCE(MAX(at.tracktotal), 0) AS tracktotal,"
-            f"       SUM(CASE WHEN UPPER(COALESCE(i.format, '')) IN {_LOSSLESS_SQL}"
-            f"           THEN 1 ELSE 0 END) AS lossless_count,"
-            f"       COUNT(DISTINCT CASE WHEN i.id IS NOT NULL"
-            f"           THEN COALESCE(NULLIF(i.disc, 0), 1) END) AS present_discs,"
-            f"       {disctotal_expr} AS max_disctotal"
+            f"       SUM(CASE WHEN UPPER(COALESCE(i.format, '')) IN {LOSSLESS_SQL}"
+            f"           THEN 1 ELSE 0 END) AS lossless_count"
             f" FROM albums a"
             f" LEFT JOIN items i ON i.album_id = a.id"
             f" LEFT JOIN album_totals at ON at.album_id = a.id"
             f" GROUP BY a.id"
         ).fetchall()
 
-        for album_id, artist, album, rgid, items, tracktotal, lossless, present_d, max_dt in rows:
-            known_total = int(tracktotal or 0)
+        for album_id, artist, album, rgid, items, tracktotal, lossless in rows:
             ic = int(items or 0)
-            present_discs = int(present_d or 0)
-            disctotal = int(max_dt or 0)
-            if disctotal > 1 and 0 < present_discs < disctotal:
-                missing_discs = disctotal - present_discs
-                base = known_total if known_total > 0 else ic
-                per_disc = max(1, round(base / present_discs))
-                tt = max(known_total, base + missing_discs * per_disc)
-            else:
-                tt = known_total
+            tt = int(tracktotal or 0)
             self._albums_by_id[album_id] = (ic, tt)
             self._lossless_by_album_id[album_id] = int(lossless or 0)
 
@@ -160,6 +198,34 @@ class BeetsLibrary:
         matches = self._by_key.get(key, [])
         return _evaluate_matches(matches, expected_tracks, min_coverage)
 
+    def lookup_owned(
+        self,
+        artist: str,
+        album: str,
+        *,
+        rgid: str | None = None,
+        expected_tracks: int | None = None,
+        min_coverage: float = 0.8,
+    ) -> OwnedResult:
+        """Canonical ownership lookup: rgid first, falling back to normalized
+        (artist, album) whenever rgid is absent OR only a partial match."""
+        rg_hit = (
+            self.rg_owned(rgid, expected_tracks, min_coverage)
+            if rgid
+            else None
+        )
+        if rg_hit and rg_hit.owned:
+            return rg_hit
+        name_hit = self.owned(artist, album, expected_tracks, min_coverage)
+        if name_hit.owned:
+            return name_hit
+        if rg_hit is not None and (
+            rg_hit.item_count > name_hit.item_count
+            or (rg_hit.item_count == name_hit.item_count and rg_hit.album_id is not None)
+        ):
+            return rg_hit
+        return name_hit
+
     def already_have(
         self,
         artist: str,
@@ -170,12 +236,19 @@ class BeetsLibrary:
         min_coverage: float = 0.8,
     ) -> OwnedResult | None:
         """Add-time ownership gate: rgid identity first, then normalized name."""
-        if rgid:
-            hit = self.rg_owned(rgid, expected_tracks, min_coverage)
-            if hit and hit.owned:
-                return hit
-        hit = self.owned(artist, album, expected_tracks, min_coverage)
+        hit = self.lookup_owned(
+            artist,
+            album,
+            rgid=rgid,
+            expected_tracks=expected_tracks,
+            min_coverage=min_coverage,
+        )
         return hit if hit.owned else None
+
+    def has_album_key(self, artist: str, album: str) -> bool:
+        """Return True if any album row matches normalized ``(artist, album)``."""
+        key = (norm_artist(artist), norm_album(album))
+        return bool(key[0] and key[1] and key in self._by_key)
 
     def album_coverage(
         self,
@@ -226,7 +299,8 @@ class LibraryCache:
                     return lib
             try:
                 lib = BeetsLibrary(db_path)
-            except (sqlite3.Error, OSError):
+            except (sqlite3.Error, OSError) as exc:
+                log.warning("failed to load beets library %s: %s", db_path, exc)
                 return None
             self._entry = (db_path, time.monotonic(), lib)
             return lib
@@ -249,13 +323,12 @@ def invalidate_library_cache() -> None:
 
 __all__ = [
     "BeetsLibrary",
-    "LOSSLESS_FORMATS",
     "LibraryCache",
     "OwnedResult",
+    "album_totals_cte",
+    "effective_track_total",
     "get_cached_library",
+    "has_items_column",
     "invalidate_library_cache",
     "library_cache",
-    "norm_album",
-    "norm_artist",
-    "normalize",
 ]
