@@ -7,7 +7,7 @@ export function token() { try { return localStorage.getItem(TOKEN_KEY) || ""; } 
 export function setToken(t) { try { t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY); } catch {} }
 
 // Who am I. Filled by boot() from /api/auth/me; every 401 re-opens the gate.
-export const session = { me: null, setupRequired: false, roles: ["viewer", "operator", "admin"] };
+export const session = { me: null, roles: ["viewer", "operator", "admin"] };
 const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
 export const can = (role) => !!session.me && (ROLE_RANK[session.me.role] ?? -1) >= (ROLE_RANK[role] ?? 99);
 export const isAdmin = () => can("admin");
@@ -136,7 +136,6 @@ function append(el, kids) {
     else el.appendChild(document.createTextNode(String(k)));
   }
 }
-export const frag = (...kids) => { const f = document.createDocumentFragment(); append(f, kids); return f; };
 export const clear = (el) => { while (el.firstChild) el.removeChild(el.firstChild); return el; };
 export const mount = (el, ...kids) => { clear(el); append(el, kids); return el; };
 export const $ = (sel, root = document) => root.querySelector(sel);
@@ -153,9 +152,6 @@ export const fmt = {
   bytes(n) { if (!n && n !== 0) return "—"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; n = Number(n); while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return (i ? n.toFixed(i > 2 ? 2 : 1) : n) + " " + u[i]; },
   date(ts) { if (!ts) return "—"; return new Date(ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }); },
   datetime(ts) { if (!ts) return "—"; return new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); },
-  time(ts) { if (!ts) return "—"; return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }); },
-  pct(x, d = 0) { return (100 * (x || 0)).toFixed(d) + "%"; },
-  kbps(k) { return k ? k + " kbps" : ""; },
 };
 
 // ---------- toast ----------
@@ -172,7 +168,11 @@ export async function busy(btn, promise) {
   try { return await promise; } finally { if (btn) btn.classList.remove("busy"); }
 }
 export function action(btn, fn) {
-  return async (ev) => { ev?.stopPropagation?.(); try { await busy(btn, fn(ev)); } catch (e) { errToast(e); } };
+  return async (ev) => {
+    ev?.stopPropagation?.();
+    const target = btn || (ev?.currentTarget instanceof Element && ev.currentTarget.classList.contains("btn") ? ev.currentTarget : null);
+    try { await busy(target, fn(ev)); } catch (e) { errToast(e); }
+  };
 }
 
 // ---------- overlay history ----------
@@ -203,7 +203,6 @@ window.addEventListener("popstate", () => {
   for (const ctl of [...overlays].reverse()) if (ctl.id > cur) overlayDestroy(ctl);
 });
 export const isPhone = () => matchMedia("(max-width: 640px)").matches;
-export const isTouch = () => matchMedia("(pointer: coarse)").matches;
 
 // ---------- modal / confirm ----------
 export function modal({ title, body, actions = [], wide = false, onClose }) {
@@ -222,10 +221,12 @@ export function modal({ title, body, actions = [], wide = false, onClose }) {
 // Mobile-friendly replacement for window.prompt(): resolves the trimmed text, or null.
 export function promptText({ title = "Name", value = "", placeholder = "", ok = "OK", hint = "" } = {}) {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
     const inp = h("input", { class: "input", value, placeholder, enterkeyhint: "done" });
-    const m = modal({ title, body: h("div", { class: "stack" }, inp, hint ? h("div", { class: "hint" }, hint) : null), onClose: () => resolve(null),
-      actions: [{ label: ok, cls: "primary", onClick: () => resolve(inp.value.trim()) }] });
-    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { resolve(inp.value.trim()); m.close(); } });
+    const m = modal({ title, body: h("div", { class: "stack" }, inp, hint ? h("div", { class: "hint" }, hint) : null), onClose: () => done(null),
+      actions: [{ label: ok, cls: "primary", onClick: () => done(inp.value.trim()) }] });
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") { done(inp.value.trim()); m.close(); } });
     setTimeout(() => inp.focus(), 40);
   });
 }
@@ -233,17 +234,21 @@ export function promptText({ title = "Name", value = "", placeholder = "", ok = 
 export const ls = { get(k, d = null) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 export function confirm({ title = "Are you sure?", body = "", ok = "Confirm", danger = false, typed = "" }) {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
     let inp = null;
     const content = h("div", { class: "stack" }, typeof body === "string" ? h("p", { class: "hint" }, body) : body);
     if (typed) { inp = h("input", { class: "input mono", placeholder: `type ${typed} to confirm` }); content.appendChild(inp); }
-    const m = modal({ title, body: content, onClose: () => resolve(false),
-      actions: [{ label: ok, cls: danger ? "danger" : "primary", onClick: () => { if (typed && inp.value.trim() !== typed) { toast("confirmation text does not match", "warn"); throw new Error("no match"); } resolve(true); } }] });
+    modal({ title, body: content, onClose: () => done(false),
+      actions: [{ label: ok, cls: danger ? "danger" : "primary", keep: true, onClick: (close) => {
+        if (typed && inp.value.trim() !== typed) { toast("confirmation text does not match", "warn"); inp.focus(); return; }
+        done(true); close();
+      } }] });
     if (inp) setTimeout(() => inp.focus(), 40);
   });
 }
 
 // ---------- drawer ----------
-const drawers = [];
 export function drawer({ title, body, wide = false, narrow = false, onClose, actions }) {
   const host = $("#drawer-host");
   const scrim = h("div", { class: "drawer-scrim" });
@@ -252,7 +257,7 @@ export function drawer({ title, body, wide = false, narrow = false, onClose, act
   const actEl = h("div", { class: "row nowrap" }, actions);
   const head = h("div", { class: "drawer-head" }, titleEl, actEl, h("button", { class: "icon-btn", onClick: () => close(), "aria-label": "Close" }, "✕"));
   const box = h("div", { class: "drawer" + (wide ? " wide" : "") + (narrow ? " narrow" : ""), role: "dialog", "aria-modal": "true" }, head, bodyEl);
-  const ovl = overlayOpen(() => { scrim.remove(); box.remove(); const i = drawers.indexOf(ctl); if (i >= 0) drawers.splice(i, 1); onClose && onClose(); });
+  const ovl = overlayOpen(() => { scrim.remove(); box.remove(); onClose && onClose(); });
   const close = () => overlayClose(ovl);
   scrim.addEventListener("click", close);
   // phone: drag the sheet handle down to dismiss
@@ -261,22 +266,25 @@ export function drawer({ title, body, wide = false, narrow = false, onClose, act
   head.addEventListener("touchmove", (e) => { if (y0 === null) return; dy = Math.max(0, e.touches[0].clientY - y0); box.style.transform = `translateY(${dy}px)`; }, { passive: true });
   head.addEventListener("touchend", () => { if (y0 === null) return; box.classList.remove("dragging"); box.style.transform = ""; if (dy > 90) close(); y0 = null; });
   host.append(scrim, box);
-  const ctl = { close, dismiss: () => overlayDestroy(ovl), body: bodyEl, setTitle: (t) => mount(titleEl, t), setActions: (a) => mount(actEl, a), _ovl: ovl };
-  drawers.push(ctl);
-  return ctl;
+  return { close, dismiss: () => overlayDestroy(ovl), body: bodyEl, setTitle: (t) => mount(titleEl, t), setActions: (a) => mount(actEl, a), _ovl: ovl };
 }
 // route change: tear everything down without touching history
 export function closeDrawers() { [...overlays].forEach(o => overlayDestroy(o)); }
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") { const top = overlays[overlays.length - 1]; if (top) overlayClose(top); else if (!$("#palette").hidden) closePalette(); } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") { const top = overlays[overlays.length - 1]; if (top) overlayClose(top); } });
 
 // ---------- selection bar ----------
 class Selection {
   constructor() { this.items = new Map(); this.label = "Selected"; this.actions = []; }
-  configure(label, actions) { this.label = label; this.actions = actions; this.render(); }
+  configure(label, actions) { this.clear(); this.label = label; this.actions = actions; this.render(); }
   toggle(key, item) { this.items.has(key) ? this.items.delete(key) : this.items.set(key, item); this.render(); return this.items.has(key); }
   has(key) { return this.items.has(key); }
   set(key, item, on) { on ? this.items.set(key, item) : this.items.delete(key); this.render(); }
-  clear() { this.items.clear(); this.render(); document.querySelectorAll(".check.on").forEach(c => c.classList.remove("on")); document.querySelectorAll(".sel").forEach(c => c.classList.remove("sel")); }
+  clear() {
+    this.items.clear();
+    this.render();
+    document.querySelectorAll(".check.on:not([data-local])").forEach(c => c.classList.remove("on"));
+    document.querySelectorAll(".sel:not([data-local])").forEach(c => c.classList.remove("sel"));
+  }
   values() { return [...this.items.values()]; }
   render() {
     const bar = $("#selbar");
@@ -362,7 +370,7 @@ export function link(name, params, ...path) { return "#/" + [name, ...path.map(e
 export function setQuery(params, replace = true) {
   const r = route(); const merged = { ...r.q, ...params };
   const hash = "#/" + [r.name, ...r.path.map(encodeURIComponent)].join("/") + qs(merged);
-  if (replace) history.replaceState(null, "", hash); else location.hash = hash;
+  if (replace) history.replaceState(history.state, "", hash); else location.hash = hash;
 }
 export function onCleanup(fn) { current.cleanups.push(fn); }
 export function poll(fn, ms, { immediate = true } = {}) {
@@ -461,7 +469,7 @@ function openMenu() {
 // data-label / data-role stamps applied here. Also: keep the active tab in
 // view, and make click-only rows/chips reachable from the keyboard.
 const PRIMARY_LABELS = new Set(["album", "job", "title", "artist", "name", "playlist", "track", "file", "entry", "peer", "what", "release", "command", "script", "dir", "path", "song", "want", "series"]);
-const A11Y_SEL = ".item.click, tr.click, .stat, .chip, .check, .cover-card, .tree .node, .palette .opt";
+const A11Y_SEL = ".item.click, tr.click, .stat:not(a), .chip, .check, .cover-card, .group-card, .dup-row, .nav-item:not(a), .tree .node, .palette .opt";
 const headersOf = (tbl) => [...tbl.querySelectorAll(":scope > thead th")].map(th => th.textContent.trim());
 function labelRow(tr, ths) {
   if (tr.dataset.labeled) return; tr.dataset.labeled = "1";
@@ -484,7 +492,7 @@ function enhance(n) {
   const act = n.matches(".tabs button.active") ? n : n.querySelector(".tabs button.active");
   if (act && matchMedia("(max-width: 900px)").matches) act.scrollIntoView({ inline: "center", block: "nearest" });
   const targets = n.matches(A11Y_SEL) ? [n, ...n.querySelectorAll(A11Y_SEL)] : [...n.querySelectorAll(A11Y_SEL)];
-  for (const el of targets) if (!el.hasAttribute("tabindex")) { el.tabIndex = 0; if (el.tagName !== "TR" && !el.hasAttribute("role")) el.setAttribute("role", el.classList.contains("check") ? "checkbox" : "button"); }
+  for (const el of targets) if (!el.closest(".plan-stats") && !el.hasAttribute("tabindex")) { el.tabIndex = 0; if (el.tagName !== "TR" && !el.hasAttribute("role")) el.setAttribute("role", el.classList.contains("check") ? "checkbox" : "button"); }
 }
 new MutationObserver((muts) => { for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) enhance(n); }).observe($("#app"), { childList: true, subtree: true });
 document.addEventListener("keydown", (e) => {
@@ -504,7 +512,7 @@ async function refreshStatus() {
   const open = (c.wanted || 0) + (c.grabbed || 0);
   document.querySelectorAll('[data-count="open"]').forEach(el => el.textContent = open ? fmt.num(open) : "");
   document.querySelectorAll('[data-count="jobs"]').forEach(el => { el.textContent = s.jobs_running ? String(s.jobs_running) : ""; el.classList.toggle("acc", !!s.jobs_running); });
-  const hb = s.heartbeat; const age = hb?.ts ? Date.now() / 1000 - hb.ts : null;
+  const hb = s.heartbeat;
   const next = hb?.ts ? hb.ts + s.interval : null;
   const pill = h("button", { class: "pill-status " + (s.apply ? "live" : "shadow"), title: "Toggle shadow/live", onClick: toggleApply }, h("span", { class: "dot " + (s.apply ? "ok" : "warn") }), s.apply ? "LIVE" : "SHADOW");
   mount($("#top-status"), can("operator") ? pill : h("span", { class: "pill-status shadow", title: "your account is read-only" }, h("span", { class: "dot" }), "READ-ONLY"),
@@ -521,7 +529,6 @@ async function refreshStatus() {
     h("div", { class: "row" }, can("operator") ? h("button", { class: "btn xs ghost", onClick: action(null, async () => { const r = await api("/api/pass", {}); toast(r.detail); }) }, "Run pass") : null,
       h("button", { class: "btn xs ghost", onClick: () => navigate("#/settings") }, "Settings")));
   store.emit();
-  void age;
 }
 function userChip() {
   const me = session.me; if (!me) return null;
@@ -540,12 +547,14 @@ async function toggleApply() {
 export function refreshStatusSoon() { clearTimeout(statusTimer); statusTimer = setTimeout(refreshStatus, 400); }
 
 // ---------- command palette ----------
-let palTimer = null, palIdx = 0, palOpts = [];
+let palTimer = null, palIdx = 0, palOpts = [], palCtl = null;
 function openPalette() {
+  if (gateEl || session.me?.must_change_pw || palCtl) return;
   const host = $("#palette"); host.hidden = false;
   const inp = h("input", { placeholder: "Search MusicBrainz, your library, or jump to a page…", autocomplete: "off" });
   const res = h("div", { class: "res" });
   mount(host, h("div", { class: "palette" }, inp, res));
+  palCtl = overlayOpen(() => { clearTimeout(palTimer); palTimer = null; palCtl = null; host.hidden = true; clear(host); });
   const renderOpts = () => mount(res, palOpts.length ? palOpts : h("div", { class: "empty small" }, "Type to search albums / artists, or a page name"));
   const run = async () => {
     const q = inp.value.trim(); palOpts = []; palIdx = 0;
@@ -560,14 +569,14 @@ function openPalette() {
       renderOpts();
       try {
         const [lib, mb] = await Promise.all([api(`/api/library/albums${qs({ q, limit: 6 })}`), api(`/api/search${qs({ kind: "album", q })}`).catch(() => ({ results: [] }))]);
-        if (inp.value.trim() !== q) return;
+        if (!palCtl || inp.value.trim() !== q) return;
         if (lib.albums?.length) palOpts.push(h("div", { class: "grp" }, "In your library"), ...lib.albums.map(a => opt("▤", `${a.artist} — ${a.album}`, `${a.year || ""} · ${a.tracks} tracks`, () => navigate(link("library", {}, "album", String(a.id))))));
         if (mb.results?.length) palOpts.push(h("div", { class: "grp" }, "MusicBrainz"), ...mb.results.slice(0, 6).map(a => opt(a.owned ? "✓" : "⌕", `${a.artist} — ${a.album}`, `${a.year || ""}${a.owned ? " · owned" : ""}`, () => navigate(link("discover", { q: `${a.artist} ${a.album}` })))));
       } catch {}
     }
-    renderOpts();
+    if (palCtl) renderOpts();
   };
-  const opt = (ico, t, s, go) => h("div", { class: "opt", onClick: () => { closePalette(); go(); } }, h("span", { class: "ico" }, ico), h("span", { class: "t" }, t), h("span", { class: "s" }, s));
+  const opt = (ico, t, s, go) => h("div", { class: "opt", onClick: () => { if (palCtl) overlayDestroy(palCtl); go(); } }, h("span", { class: "ico" }, ico), h("span", { class: "t" }, t), h("span", { class: "s" }, s));
   inp.addEventListener("input", () => { clearTimeout(palTimer); palTimer = setTimeout(run, 220); });
   inp.addEventListener("keydown", (e) => {
     const opts = [...res.querySelectorAll(".opt")];
@@ -578,10 +587,14 @@ function openPalette() {
   host.onclick = (e) => { if (e.target === host) closePalette(); };
   run(); setTimeout(() => inp.focus(), 30);
 }
-function closePalette() { const host = $("#palette"); host.hidden = true; clear(host); }
+function closePalette() { if (palCtl) overlayClose(palCtl); else { clearTimeout(palTimer); const host = $("#palette"); host.hidden = true; clear(host); } }
 document.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); $("#palette").hidden ? openPalette() : closePalette(); }
-  if (e.key === "/" && !/input|textarea|select/i.test(document.activeElement?.tagName || "")) { e.preventDefault(); openPalette(); }
+  if (gateEl || session.me?.must_change_pw) return;
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    if (!palCtl && overlays.length) return;
+    e.preventDefault(); palCtl ? closePalette() : openPalette();
+  }
+  if (e.key === "/" && !overlays.length && !/input|textarea|select/i.test(document.activeElement?.tagName || "")) { e.preventDefault(); openPalette(); }
 });
 
 // ---------- boot ----------
@@ -591,7 +604,7 @@ async function boot(afterGate = false) {
     let me;
     try { me = await api("/api/auth/me"); }
     catch (e) { return authUnavailable(e); }
-    if (me.setup_required) { session.setupRequired = true; return authGate("setup"); }
+    if (me.setup_required) return authGate("setup");
     if (!me.user) return authGate("login");
     session.me = me.user; session.roles = me.roles || session.roles;
     if (me.user.must_change_pw) return authGate("password");

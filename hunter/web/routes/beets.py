@@ -10,20 +10,6 @@ from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
 
-log = common.log
-
-_SINGLE_PASS_COUNTER = (
-    "import subprocess,sys;"
-    "p=subprocess.Popen(sys.argv[1:],stdout=subprocess.PIPE,text=True,errors='replace');"
-    "n=0\n"
-    "for ln in p.stdout:\n"
-    " n+=1\n"
-    " if n<=40: sys.stdout.write(ln)\n"
-    "rc=p.wait()\n"
-    "print(f'__HUNTER_COUNT__={n}')\n"
-    "sys.exit(rc)"
-)
-
 
 def _docker(ctx: Ctx) -> DockerClient:
     return DockerClient(ctx.cfg.docker_sock)
@@ -62,8 +48,9 @@ def watcher_restart(ctx: Ctx):
     if not d.available:
         return ctx.error(503, "docker socket not mounted")
     res = beetsops.restart_watcher(ctx.cfg, d)
-    with common.state(ctx.cfg) as st:
-        st.log_event("automation", detail="beets watcher bounced via ui")
+    if res.get("ok"):
+        with common.state(ctx.cfg) as st:
+            st.log_event("automation", detail="beets watcher bounced via ui")
     return ctx.json(200 if res["ok"] else 502, res)
 
 
@@ -261,47 +248,13 @@ def _quick(ctx: Ctx, argv: list[str], timeout: int = 45) -> dict:
     res = d.exec_run(
         ctx.cfg.beets_container,
         beetcmd.beet_argv(ctx.cfg) + argv,
-        user=getattr(ctx.cfg, "beets_exec_user", ""),
+        user=ctx.cfg.beets_exec_user_str,
         timeout=timeout,
     )
     out = res["output"]
     if len(out) > 200_000:
         out = out[:200_000] + "\n… (truncated)"
     return {"exit_code": res["exit_code"], "output": out}
-
-
-def count_matches(
-    ctx: Ctx, qtoks: list[str], album: bool, timeout: int = 90
-) -> tuple[int, list[list[str]], int | None]:
-    """Single-pass blast radius: runs ``beet ls`` ONCE, preserves exit code."""
-    d = _docker(ctx)
-    argv = beetcmd.beet_argv(ctx.cfg) + beetcmd.preview_argv(qtoks, album)
-    py = (getattr(ctx.cfg, "beets_python", "") or "python3").strip() or "python3"
-    res = d.exec_run(
-        ctx.cfg.beets_container,
-        [py, "-c", _SINGLE_PASS_COUNTER, *argv],
-        user=getattr(ctx.cfg, "beets_exec_user", ""),
-        timeout=timeout,
-    )
-    count = 0
-    sample: list[list[str]] = []
-    for ln in res["output"].splitlines():
-        if ln.startswith("__HUNTER_COUNT__="):
-            try:
-                count = int(ln.split("=", 1)[1].strip())
-            except ValueError:
-                count = 0
-        elif ln.startswith("count="):
-            try:
-                count = int(ln[6:].strip())
-            except ValueError:
-                count = 0
-        elif "\t" in ln:
-            sample.append(ln.split("\t"))
-    return count, sample, res["exit_code"]
-
-
-_count_matches = count_matches
 
 
 @post("/api/beets/preview")
@@ -329,7 +282,7 @@ def preview(ctx: Ctx):
     if cmd.query == "none":
         return ctx.json(200, out)
     try:
-        count, sample, rc = count_matches(ctx, qtoks, album)
+        count, sample, rc = beetsops.count_matches(ctx.cfg, _docker(ctx), qtoks, album)
     except DockerError as exc:
         return ctx.error(502, str(exc))
     out["count"] = count
@@ -357,29 +310,15 @@ def run(ctx: Ctx):
     if cmd is None:
         return ctx.error(400, "unknown command")
     if cmd.cls == "mutate" and apply:
-        try:
-            count, _sample, rc = count_matches(ctx, qtoks, album)
-        except DockerError as exc:
-            return ctx.error(502, str(exc))
-        if rc not in (0, None):
-            return ctx.error(502, f"beet preview count failed (exit {rc})")
-        if count == 0 and cmd.query != "none":
-            return ctx.error(400, "query matches nothing — refusing to run")
-        if count > beetcmd.HARD_MAX and not ctx.bb("allow_all"):
-            return ctx.error(
-                400,
-                f"query matches {count} rows (> {beetcmd.HARD_MAX}); use a narrower query",
-            )
-        if beetcmd.needs_confirm(cmd, qtoks, count, argv):
-            if ctx.bi("confirm_count", -1) != count:
-                return ctx.json(
-                    409,
-                    {
-                        "error": "confirm_count required",
-                        "count": count,
-                        "needs_confirm": True,
-                    },
-                )
+        err = beetsops.guard_mutation(
+            cfg,
+            _docker(ctx),
+            argv,
+            allow_all=ctx.bb("allow_all"),
+            confirm_count=ctx.bi("confirm_count", -1),
+        )
+        if err is not None:
+            return ctx.json(err[0], err[1])
     if ctx.bb("quick") and cmd.quick:
         try:
             res = _quick(ctx, argv)

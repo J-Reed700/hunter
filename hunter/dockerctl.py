@@ -13,6 +13,7 @@ import http.client
 import json
 import os
 import socket
+import time
 from urllib.parse import quote
 
 _FRAME_HEADER = 8   # non-TTY streams: 8-byte header per frame
@@ -25,8 +26,8 @@ class DockerError(RuntimeError):
 
 class DockerClient:
     def __init__(self, sock_path: str | None = None, timeout: int = 30):
-        self.sock_path = sock_path or os.environ.get(
-            "DOCKER_SOCK", "/var/run/docker.sock")
+        env_sock = (os.environ.get("DOCKER_SOCK") or "").strip()
+        self.sock_path = (sock_path or "").strip() or env_sock or "/var/run/docker.sock"
         self.timeout = timeout
 
     @property
@@ -190,6 +191,16 @@ class DockerClient:
             return {"output": "", "exit_code": None, "exec_id": exec_id}
         out = self._demux(body)
         info = self.exec_inspect(exec_id, timeout=timeout)
+        deadline = time.monotonic() + min(2.0, max(0.2, float(timeout)))
+        while (
+            info.get("running")
+            and not info.get("unreachable")
+            and not info.get("missing")
+            and not info.get("invalid")
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+            info = self.exec_inspect(exec_id, timeout=timeout)
         if info.get("unreachable") or info.get("missing") or info.get("invalid"):
             raise DockerError(
                 f"exec inspect failed on {name} ({exec_id}): {info}")
@@ -212,3 +223,6 @@ class DockerClient:
                     "exit_code": d.get("ExitCode"), "pid": d.get("Pid")}
         except json.JSONDecodeError:
             return {"running": False, "exit_code": None, "invalid": True}
+
+
+__all__ = ["DockerClient", "DockerError", "MAX_RESPONSE_BYTES"]

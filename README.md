@@ -17,26 +17,42 @@ Hunter is a lightweight, self-hosted music acquisition orchestrator and library 
                     └───────────────────────────────────────────────────────────────────┘
 ```
 
-Hunter never deletes or modifies your media files directly. It enqueues downloads and syncs playlists; optional library mutations (tagging, removal to quarantine, blocklist updates) execute inside your beets container through allowlisted, dry-run-first jobs.
+Hunter never deletes or modifies your media files directly. It enqueues downloads and syncs playlists; optional library mutations (tagging, journaled removal to quarantine, undo) execute inside your beets container through allowlisted, dry-run-first jobs.
+
+---
+
+## Requirements & How Hunter Fits Your Stack
+
+- **Required:**
+  - **[beets](https://beets.io/)** (`musiclibrary.db` mounted into Hunter, opened strictly `mode=ro`) — Hunter uses beets as its single source of truth for what you already own, browsing the library, gap-fill/lossless-upgrade seeding, and retiring wants once downloads land.
+  - **Your own beets import workflow** (e.g., `beet import`, a cron job, or a folder watcher) — Hunter enqueues downloads into `slskd` / Prowlarr; once your importer adds those files to `musiclibrary.db`, Hunter's next reconcile pass marks the wants done.
+  - **[slskd](https://github.com/slskd/slskd)** (and/or **Prowlarr**) — for searching and downloading albums.
+- **Optional (disabled automatically when unconfigured/unmounted):**
+  - **Spotify** (browser `sp_dc` cookie or developer OAuth app) for syncing playlists, saved albums, liked songs, and followed artists.
+  - **Navidrome** (Subsonic API + optional read-only `navidrome.db`) for playlist mirroring and play-weighted backlog sorting.
+  - **Prowlarr**, **AudioMuse**, **ntfy/Gotify/Discord webhooks**.
+  - **Docker socket** (`/var/run/docker.sock:ro`) to enable the live `beet` console, container status checks, and journaled undoable removals inside any stock beets container (Hunter bundles its own portable removal/undo helper and native `/state/artist_blocklist.txt` — no external helper scripts required; if you mount custom maintenance scripts at `HUNTER_BEETS_AUTOMATION`, they appear automatically in **Beets → Scripts**).
 
 ---
 
 ## Quick Start
 
-1. **Copy the example configuration files:**
+1. **Download the compose and environment templates:**
    ```sh
-   cp docker-compose.example.yml docker-compose.yml
-   cp .env.example .env
+   curl -fsSLO https://raw.githubusercontent.com/J-Reed700/hunter/main/docker-compose.example.yml
+   curl -fsSLO https://raw.githubusercontent.com/J-Reed700/hunter/main/.env.example
+   mv docker-compose.example.yml docker-compose.yml
+   mv .env.example .env
    ```
 
 2. **Edit `.env` and `docker-compose.yml`:**
-   - Mount your persistent state directory to `/state` and your music library (read-only) to `/music`.
+   - Mount your persistent state directory to `/state`, your music library (read-only) to `/music`, and your beets config directory (`musiclibrary.db`) to `/beets`.
    - Set `SLSKD_URL` and `SLSKD_API_KEY` (and optionally `NAVIDROME_*`, `PROWLARR_*`, `SPOTIFY_*`, `NOTIFY_WEBHOOK_URL`).
    - Keep `HUNTER_APPLY=0` initially to run in **Shadow Mode** (syncs, reconciles, and searches without enqueueing downloads or writing playlists).
 
-3. **Start Hunter:**
+3. **Start Hunter (pulls multi-arch `ghcr.io/j-reed700/hunter:latest`):**
    ```sh
-   docker compose up -d --build
+   docker compose up -d
    ```
 
 4. **Open the Web UI** at `http://<host>:8080`.

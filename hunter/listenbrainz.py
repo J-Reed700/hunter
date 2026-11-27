@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import logging
 import math
-import threading
-import time
 
 from hunter.config import HunterConfig
 from hunter.http_client import (
     HttpError,
     HttpSession,
-    default_user_agent,
+    PoliteClient,
     parse_retry_after,
 )
 
@@ -24,43 +22,12 @@ log = logging.getLogger("hunter.listenbrainz")
 LB = "https://api.listenbrainz.org/1"
 _TIMEOUT = 12
 _MIN_INTERVAL = 1.05
-_rate_lock = threading.Lock()
-_next_slot = 0.0
-_thread_local = threading.local()
-
-
-def _user_agent(cfg: HunterConfig | None = None) -> str:
-    eff = cfg
-    if eff is None:
-        try:
-            eff = HunterConfig.from_env()
-        except Exception:                           # noqa: BLE001
-            eff = None
-    return default_user_agent(eff)
+_client = PoliteClient(timeout=_TIMEOUT, min_interval=_MIN_INTERVAL)
 
 
 def _session(cfg: HunterConfig | None = None) -> HttpSession:
     """Return a per-thread HttpSession with dynamically computed User-Agent."""
-    ua = _user_agent(cfg)
-    sess = getattr(_thread_local, "http", None)
-    if sess is None:
-        sess = HttpSession(timeout=_TIMEOUT, user_agent=ua)
-        _thread_local.http = sess
-    else:
-        sess.headers["User-Agent"] = ua
-    return sess
-
-
-def _reserve_slot(min_interval: float = _MIN_INTERVAL) -> None:
-    """Reserve the next rate-limit slot under lock, then sleep outside lock."""
-    global _next_slot
-    with _rate_lock:
-        now = time.monotonic()
-        slot = max(now, _next_slot)
-        _next_slot = slot + min_interval
-    delay = slot - now
-    if delay > 0:
-        time.sleep(delay)
+    return _client.session(cfg)
 
 
 def release_group_listens_checked(
@@ -71,7 +38,6 @@ def release_group_listens_checked(
     """Return ``({rgid: total_listen_count}, complete)`` for a batch of
     release-group MBIDs. ``complete`` is False if any batch failed or returned
     malformed data so callers don't poison caches with partial results."""
-    global _next_slot
     clean = list(dict.fromkeys(r.strip() for r in rgids if isinstance(r, str) and r.strip()))
     if not clean:
         return {}, True
@@ -83,7 +49,7 @@ def release_group_listens_checked(
         batch = clean[i:i + 50]
         batch_ok = False
         for attempt in range(2):
-            _reserve_slot()
+            _client.limiter.acquire()
             try:
                 resp = http.post(
                     f"{LB}/popularity/release-group",
@@ -93,16 +59,18 @@ def release_group_listens_checked(
                 )
             except HttpError as exc:
                 log.warning("LB rg-popularity failed: %s", exc)
+                if attempt == 0:
+                    _client.limiter.push_back(2.0)
+                    continue
                 break
 
-            if resp.status_code == 429:
+            if resp.status_code in (429, 502, 503, 504):
                 ra = parse_retry_after(resp.headers.get("Retry-After"), default=2.0, cap=30.0)
-                with _rate_lock:
-                    _next_slot = max(_next_slot, time.monotonic() + ra)
+                _client.limiter.push_back(ra)
                 if attempt == 0:
-                    log.warning("LB rate-limited (429) — waiting %.1fs", ra)
+                    log.warning("LB transient HTTP %d — waiting %.1fs", resp.status_code, ra)
                     continue
-                log.warning("LB rate-limited (429) on retry — marking incomplete")
+                log.warning("LB transient HTTP %d on retry — marking incomplete", resp.status_code)
                 break
 
             if resp.status_code != 200:
@@ -136,26 +104,27 @@ def release_group_listens_checked(
 
         if not batch_ok:
             complete = False
+            break
     return out, complete
 
 
-def release_group_listens(rgids: list[str]) -> dict[str, int]:
-    """{rgid: total_listen_count} for a batch of release-groups."""
-    counts, _complete = release_group_listens_checked(rgids)
-    return counts
-
-
-def canon_scores_checked(artist_mbid: str, rgs: list[dict]) -> tuple[list[dict], bool]:
+def canon_scores_checked(
+    rgs: list[dict],
+    *,
+    cfg: HunterConfig | None = None,
+) -> tuple[list[dict], bool]:
     """Return ``(scored, complete)`` normalized essentiality per release-group."""
     rgids = [r.get("rgid", "") for r in rgs if isinstance(r, dict)]
-    listens, complete = release_group_listens_checked(rgids)
+    listens, complete = release_group_listens_checked(rgids, cfg=cfg)
     scored = []
+    seen: set[str] = set()
     for rg in rgs:
         if not isinstance(rg, dict):
             continue
         rgid = rg.get("rgid")
-        if not rgid:
+        if not rgid or rgid in seen:
             continue
+        seen.add(rgid)
         n = listens.get(rgid, 0)
         if n <= 0:
             continue
@@ -174,9 +143,9 @@ def canon_scores_checked(artist_mbid: str, rgs: list[dict]) -> tuple[list[dict],
     return scored, complete
 
 
-def canon_scores(artist_mbid: str, rgs: list[dict]) -> list[dict]:
+def canon_scores(rgs: list[dict], *, cfg: HunterConfig | None = None) -> list[dict]:
     """Normalized essentiality per release-group given the artist's RGs.
     Returns [] if any ListenBrainz batch failed so partial batches do not
     poison the 7-day canon cache."""
-    scored, complete = canon_scores_checked(artist_mbid, rgs)
+    scored, complete = canon_scores_checked(rgs, cfg=cfg)
     return scored if complete else []

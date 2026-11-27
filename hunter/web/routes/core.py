@@ -7,7 +7,7 @@ import time
 
 import requests
 
-from hunter import config as config_mod, db, domain, storage
+from hunter import config as config_mod, domain, http_client, libquery, storage
 from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
@@ -16,7 +16,7 @@ _UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 _ART_MAX_BYTES = 5 * 1024 * 1024
-_ART_ALLOWED_TYPES = frozenset({"image/jpeg", "image/jpg", "image/png", "image/webp"})
+_ART_ALLOWED_TYPES = frozenset({"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"})
 
 
 @get("/api/status")
@@ -24,6 +24,7 @@ def status(ctx: Ctx):
     from hunter import __version__
 
     cfg = ctx.cfg
+    is_op = bool(ctx.user and ctx.user.can("operator"))
     with common.state(cfg) as st:
         counts = st.counts()
     heartbeat = None
@@ -44,7 +45,7 @@ def status(ctx: Ctx):
     spotify = {
         "configured": cfg.spotify_configured,
         "ok": bool(cfg.spotify_configured) and not sync_err,
-        "error": sync_err,
+        "error": sync_err if is_op else ("sync error" if sync_err else ""),
         "needs_spdc": ("premium" in low or "403" in low or "subscription" in low),
     }
     jobs = common.jobs(cfg)
@@ -67,17 +68,17 @@ def status(ctx: Ctx):
                     "started_ts": j["started_ts"],
                 }
                 for j in running[:8]
-            ],
-            "console": cfg.beets_console_available,
+            ] if is_op else [],
+            "console": cfg.beets_console_available if is_op else False,
             "storage": storage.summary(cfg),
             "slskd": cfg.slskd_configured,
             "prowlarr": cfg.prowlarr_configured,
             "navidrome": bool(cfg.navidrome_user),
             "audiomuse": bool(getattr(cfg, "audiomuse_token", "")),
-            "music_root": str(cfg.music_root),
+            "music_root": str(cfg.music_root) if is_op else "",
             "quarantine_dir": (
                 str(cfg.quarantine_dir)
-                if getattr(cfg, "quarantine_enabled", True)
+                if is_op and getattr(cfg, "quarantine_enabled", True)
                 else None
             ),
         },
@@ -88,6 +89,7 @@ def status(ctx: Ctx):
 def pulse(ctx: Ctx):
     """Everything the dashboard needs in one read."""
     cfg = ctx.cfg
+    is_op = bool(ctx.user and ctx.user.can("operator"))
     with common.state(cfg) as st:
         counts = st.counts()
         sc = st.source_counts()
@@ -100,33 +102,12 @@ def pulse(ctx: Ctx):
             )
         ]
 
-    lib = None
     try:
-        conn = db.open_readonly_db(cfg.beets_db, timeout=10.0)
-        try:
-            items, albums = conn.execute(
-                "SELECT (SELECT COUNT(*) FROM items),(SELECT COUNT(*) FROM albums)"
-            ).fetchone()
-            now = time.time()
-            a24, a7 = conn.execute(
-                "SELECT"
-                " COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0),"
-                " COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0)"
-                " FROM items",
-                (now - 86_400, now - 604_800),
-            ).fetchone()
-            lib = {
-                "items": items,
-                "albums": albums,
-                "added_24h": a24,
-                "added_7d": a7,
-            }
-        finally:
-            conn.close()
+        lib = libquery.pulse_counts(cfg)
     except Exception:                                 # noqa: BLE001
         lib = None
 
-    jobs = common.jobs(cfg)
+    jobs_out = common.jobs(cfg).list(limit=6) if is_op else []
     return ctx.json(
         200,
         {
@@ -136,7 +117,7 @@ def pulse(ctx: Ctx):
             "events": events,
             "recent_done": recent_done,
             "library": lib,
-            "jobs": jobs.list(limit=6),
+            "jobs": jobs_out,
             "apply": cfg.apply,
             "interval": cfg.interval,
         },
@@ -253,18 +234,24 @@ def art(ctx: Ctx):
     art_dir.mkdir(parents=True, exist_ok=True)
     cached = art_dir / f"{rgid}.jpg"
     miss = art_dir / f"{rgid}.miss"
-    if not cached.exists() and miss.exists() and time.time() - miss.stat().st_mtime < 604_800:
-        return ctx.error(404, "no art")
+    if not cached.exists():
+        try:
+            if time.time() - miss.stat().st_mtime < 604_800:
+                return ctx.error(404, "no art")
+        except OSError:
+            pass
     if not cached.exists():
         got = False
+        sess = common.ART_CLIENT.session(cfg)
         for size in ("250", "500"):
             try:
-                resp = common.ART_SESSION.get(
+                resp = sess.get(
                     f"https://coverartarchive.org/release-group/{rgid}/front-{size}",
-                    timeout=(4, 9),
+                    timeout=10.0,
                     stream=True,
+                    raise_for_status=False,
                 )
-            except requests.RequestException:
+            except (http_client.HttpError, requests.RequestException):
                 continue
             try:
                 if resp.status_code == 404:
@@ -297,7 +284,10 @@ def art(ctx: Ctx):
             finally:
                 resp.close()
         if not got:
-            miss.touch()
+            try:
+                miss.touch()
+            except OSError:
+                pass
             return ctx.error(404, "no art")
     try:
         cached_bytes = cached.read_bytes()
@@ -341,15 +331,16 @@ def run_pass(ctx: Ctx):
             exclusive="hunter-pass",
         )
         if not res["ok"]:
-            return ctx.json(200, {"detail": res["error"]})
+            return ctx.json(409, {"error": res["error"], "detail": res["error"]})
         return ctx.json(200, {"detail": "pass started", "job": res["job"]})
     common.spawn_pass()
     return ctx.json(200, {"detail": "pass started (no-op if one is running)"})
 
 
 @post("/api/apply")
-@post("/api/mode")
 def set_apply(ctx: Ctx):
+    if "apply" not in ctx.body:
+        return ctx.error(400, "apply boolean required")
     target = ctx.bb("apply")
     config_mod.save_apply_override(ctx.cfg, target)
     common.log.info("apply mode set to %s via UI", target)

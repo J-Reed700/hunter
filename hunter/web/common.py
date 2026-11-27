@@ -13,7 +13,7 @@ from typing import Any
 
 import requests
 
-from hunter import http_client, library as library_mod, mb
+from hunter import domain, http_client, libops, library as library_mod, mb
 from hunter.config import HunterConfig
 from hunter.jobs import Jobs
 from hunter.library import BeetsLibrary
@@ -21,11 +21,15 @@ from hunter.state import HunterState
 
 log = logging.getLogger("hunter.webui")
 
-ART_SESSION = requests.Session()
-ART_SESSION.headers["User-Agent"] = http_client.default_user_agent(None, "hunter-art")
+ART_CLIENT = http_client.PoliteClient(
+    component="hunter-art", timeout=10.0, min_interval=0.0
+)
+
+_JOB_FINALIZERS = {"library": libops.on_library_job}
 
 _children_lock = threading.Lock()
 _children: set[subprocess.Popen] = set()
+_children_args: dict[subprocess.Popen, tuple[str, ...]] = {}
 
 
 def library(cfg: HunterConfig) -> BeetsLibrary | None:
@@ -70,10 +74,7 @@ def _extract_rgid(row: dict[str, Any]) -> str | None:
     if rgid:
         return str(rgid)
     key = str(row.get("key") or row.get("spotify_album_id") or "")
-    for prefix in ("request:rg:", "release:rg:"):
-        if key.startswith(prefix):
-            return key[len(prefix):]
-    return None
+    return domain.extract_rgid_from_key(key)
 
 
 def annotate_owned(
@@ -92,12 +93,13 @@ def annotate_owned(
         album = r.get("album", "")
         mkey = (rgid, artist, album, expected)
         if mkey not in memo:
-            res = None
-            if rgid:
-                res = lib.rg_owned(rgid, expected, cfg.owned_coverage)
-            if res is None:
-                res = lib.owned(artist, album, expected, cfg.owned_coverage)
-            memo[mkey] = res
+            memo[mkey] = lib.lookup_owned(
+                artist,
+                album,
+                rgid=rgid,
+                expected_tracks=expected,
+                min_coverage=cfg.owned_coverage,
+            )
         res = memo[mkey]
         r["owned"] = res.owned
         r["have"] = res.item_count
@@ -120,8 +122,11 @@ def annotate_sp_owned(
         expected = r.get("album_total") or r.get("total_tracks") or None
         key = (r.get("artist") or "", r.get(album_key) or "", expected)
         if key not in cache:
-            cache[key] = lib.owned(
-                key[0], key[1], expected, cfg.owned_coverage
+            cache[key] = lib.lookup_owned(
+                key[0],
+                key[1],
+                expected_tracks=expected,
+                min_coverage=cfg.owned_coverage,
             )
         res = cache[key]
         r["owned"] = res.owned
@@ -141,7 +146,7 @@ def state(cfg: HunterConfig):
 
 
 def jobs(cfg: HunterConfig) -> Jobs:
-    return Jobs(cfg)
+    return Jobs(cfg, finalizers=_JOB_FINALIZERS)
 
 
 def _reap_proc(proc: subprocess.Popen) -> None:
@@ -152,6 +157,13 @@ def _reap_proc(proc: subprocess.Popen) -> None:
     finally:
         with _children_lock:
             _children.discard(proc)
+            _children_args.pop(proc, None)
+
+
+def tracked_child_pids() -> set[int]:
+    """PIDs of live background pass subprocesses tracked by the web layer."""
+    with _children_lock:
+        return {p.pid for p in _children if p.poll() is None}
 
 
 def reap_children() -> int:
@@ -160,10 +172,20 @@ def reap_children() -> int:
         done = [p for p in _children if p.poll() is not None]
         for p in done:
             _children.discard(p)
+            _children_args.pop(p, None)
         return len(done)
 
 
 def spawn_pass(*extra: str) -> subprocess.Popen | None:
+    key = tuple(extra)
+    with _children_lock:
+        for p in list(_children):
+            if p.poll() is not None:
+                _children.discard(p)
+                _children_args.pop(p, None)
+                continue
+            if _children_args.get(p) == key:
+                return p
     try:
         proc = subprocess.Popen(
             [sys.executable, "-m", "hunter.cli", "pass", *extra]
@@ -173,6 +195,7 @@ def spawn_pass(*extra: str) -> subprocess.Popen | None:
         return None
     with _children_lock:
         _children.add(proc)
+        _children_args[proc] = key
     threading.Thread(
         target=_reap_proc, args=(proc,), daemon=True, name="pass-reaper"
     ).start()
@@ -202,7 +225,3 @@ def fetch_counts_async(
     threading.Thread(
         target=work, daemon=True, name="count-backfill"
     ).start()
-
-
-def want_status_map(st: HunterState, keys: list[str]) -> dict[str, dict[str, Any]]:
-    return st.wants_status_map(keys)

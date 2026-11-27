@@ -3,8 +3,8 @@
    handful, or take everything that matches the filter. A re-request is
    album-shaped because that is what Soulseek serves, but selection stays
    per-track so you can see exactly what was lost. */
-import { api, h, mount, fmt, toast, action, confirm, busy, sel, setQuery, qs, can, onCleanup } from "../app.js";
-import { openAlbum, openTrack } from "./_shared.js";
+import { api, h, mount, fmt, toast, action, confirm, busy, sel, setQuery, qs, can } from "../app.js";
+import { openAlbum, openTrack, debouncedInput } from "./_shared.js";
 
 const SORTS = [["artist", "Artist · album · track"], ["album", "Album"], ["title", "Title"],
                ["added", "Recently added first"], ["size", "Largest first"]];
@@ -14,24 +14,31 @@ export default {
     const state = { q: r.q.q || "", sort: r.q.sort || "artist", fmt: r.q.fmt || "",
                     artist: r.q.artist || "", album_id: +(r.q.album_id || 0),
                     offset: 0, limit: 100 };
-    let searchTimer = null;
-    onCleanup(() => clearTimeout(searchTimer));
-    const head = h("div", {}), body = h("div", {});
+    const head = h("div", {}), filterHost = h("div", { class: "facets" }), body = h("div", {});
+    const searchInp = debouncedInput({
+      placeholder: "Search artist, album or title",
+      value: state.q,
+      delay: 320,
+      onInput: (val) => { state.q = val; state.offset = 0; setQuery({ q: state.q }); load(); },
+    });
+    const selectsHost = h("div", { class: "facet-selects" });
+    const activeHost = h("div", { class: "row facet-active" });
+    mount(filterHost, h("div", { class: "facet-row" }, searchInp, selectsHost), activeHost);
     mount(root, h("div", { class: "page-head" }, h("div", {},
       h("h1", {}, "Recovery"),
-      h("div", { class: "sub" }, "Tracks beets has in the library whose file is no longer on disk. This is the exact loss — not a download-history guess. Select any number and re-request them."))), head, body);
+      h("div", { class: "sub" }, "Tracks beets has in the library whose file is no longer on disk. This is the exact loss — not a download-history guess. Select any number and re-request them."))), head, filterHost, body);
 
     const params = () => ({ q: state.q, sort: state.sort, fmt: state.fmt, artist: state.artist,
                             album_id: state.album_id || "" });
-    let res = null;
+    let res = null, loadGen = 0;
 
-    const requeue = async (payload, label) => {
+    const requeue = async (payload) => {
       const r2 = await api("/api/recovery/requeue", payload);
       if (r2.returned) toast(`${fmt.num(r2.returned)} of those files are back on disk — skipped`, "warn", 5000);
       if (r2.queued) toast(`Queued ${fmt.num(r2.queued)} album${r2.queued === 1 ? "" : "s"} covering ${fmt.num(r2.tracks || 0)} track${r2.tracks === 1 ? "" : "s"}`, "ok", 5000);
       else if (!r2.returned) toast(r2.note || "Nothing queued — already wanted or blocked", "warn", 5000);
       sel.clear();
-      await load(true);
+      await load();
     };
 
     sel.configure("tracks", [
@@ -49,11 +56,11 @@ export default {
         h("div", { class: "row between mb", style: { flexWrap: "wrap", gap: "8px" } },
           h("span", { class: "muted small" },
             `${fmt.num(res.library_items)} items in the library · `,
-            healthy ? h("span", { class: "ok" }, "all files present")
+            healthy ? h("span", { class: "good" }, "all files present")
                     : h("b", { class: res.trusted ? "bad" : "" }, `${fmt.num(res.missing)} missing (${fmt.bytes(res.library_bytes)})`),
             res.scanned_ts ? ` · checked ${fmt.ago(res.scanned_ts)}` : ""),
           h("span", { class: "row", style: { gap: "6px" } },
-            h("button", { class: "btn xs ghost", onClick: action(null, () => load(true, true)) }, "Re-check now"),
+            h("button", { class: "btn xs ghost", onClick: action(null, () => load(true)) }, "Re-check now"),
             res.trusted && res.total && can("operator")
               ? h("button", { class: "btn xs danger", onClick: action(null, async () => {
                   if (!await confirm({ title: `Re-request all ${fmt.num(res.total)} missing tracks?`,
@@ -63,21 +70,17 @@ export default {
                 }) }, `Re-request all ${fmt.num(res.total)}`) : null)));
     }
 
-    function filters() {
-      const input = h("input", { class: "input", type: "search", placeholder: "Search artist, album or title", value: state.q, enterkeyhint: "search" });
-      input.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.q = input.value.trim(); state.offset = 0; setQuery({ q: state.q }); load(); }, 320); });
+    function paintFilterControls() {
       const select = (key, opts, first) => {
         const s = h("select", { class: "select sm", "aria-label": key }, ...(first ? [first] : []).concat(opts).map(([v, l]) => h("option", { value: v, selected: String(state[key] || "") === v }, l)));
         s.addEventListener("change", () => { state[key] = s.value; state.offset = 0; setQuery({ [key]: s.value }); load(); });
         return s;
       };
-      return h("div", { class: "facets" }, h("div", { class: "facet-row" }, input,
-        h("div", { class: "facet-selects" },
-          select("fmt", (res.formats || []).map(f => [f, f]), ["", "Any format"]),
-          select("sort", SORTS))),
-        state.artist || state.album_id ? h("div", { class: "row facet-active" },
-          h("span", { class: "chip active", onClick: () => { state.artist = ""; state.album_id = 0; setQuery({ artist: "", album_id: "" }); load(); } },
-            state.artist ? `artist: ${state.artist}` : `album #${state.album_id}`, " ✕")) : null);
+      mount(selectsHost,
+        select("fmt", (res.formats || []).map(f => [f, f]), ["", "Any format"]),
+        select("sort", SORTS));
+      mount(activeHost, state.artist || state.album_id ? h("span", { class: "chip active", onClick: () => { state.artist = ""; state.album_id = 0; setQuery({ artist: "", album_id: "" }); load(); } },
+        state.artist ? `artist: ${state.artist}` : `album #${state.album_id}`, " ✕") : null);
     }
 
     function albumCards() {
@@ -103,15 +106,16 @@ export default {
           : "Nothing matches this filter.");
       const rows = res.tracks.map(t => {
         const key = "t" + t.id;
+        const tr = h("tr", { class: sel.has(key) ? "sel" : "" });
         const check = h("span", { class: "check" + (sel.has(key) ? " on" : ""), role: "checkbox", tabindex: 0,
-          onClick: (e) => { e.stopPropagation(); e.currentTarget.classList.toggle("on", sel.toggle(key, t)); } });
-        return h("tr", { class: sel.has(key) ? "sel" : "" },
+          onClick: (e) => { e.stopPropagation(); const on = sel.toggle(key, t); e.currentTarget.classList.toggle("on", on); tr.classList.toggle("sel", on); } }, "✓");
+        mount(tr,
           h("td", {}, can("operator") ? check : null),
-          h("td", {}, h("a", { class: "lnk", onClick: () => openTrack(t.id) }, t.title),
+          h("td", {}, h("button", { class: "lnk", type: "button", onClick: () => openTrack(t.id) }, t.title),
                       t.track ? h("span", { class: "muted xs" }, ` · #${t.track}`) : null),
           h("td", { class: "ellip" }, t.albumartist),
           h("td", { class: "ellip" }, t.album_id
-              ? h("a", { class: "lnk", onClick: () => openAlbum(t.album_id) }, t.album || "—")
+              ? h("button", { class: "lnk", type: "button", onClick: () => openAlbum(t.album_id) }, t.album || "—")
               : (t.album || "—")),
           h("td", {}, t.format || "—"),
           h("td", {}, t.length ? fmt.dur(t.length) : "—"),
@@ -119,6 +123,7 @@ export default {
           h("td", {}, can("operator")
             ? h("button", { class: "btn xs primary", onClick: action(null, () => requeue({ item_ids: [t.id] })) }, "Recover")
             : null));
+        return tr;
       });
       return h("div", { class: "card tight" }, h("table", { class: "table" },
         h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "Title"), h("th", {}, "Artist"),
@@ -143,17 +148,23 @@ export default {
         const k = await busy(ev.currentTarget, api("/api/recovery/keys" + qs(params())));
         const byId = new Map(res.tracks.map(t => [t.id, t]));
         k.item_ids.forEach(id => sel.set("t" + id, byId.get(id) || { id }, true));
-        document.querySelectorAll(".check").forEach(c => c.classList.add("on"));
+        body.querySelectorAll(".check").forEach(c => c.classList.add("on"));
+        body.querySelectorAll("tbody tr").forEach(tr => tr.classList.add("sel"));
         toast(k.capped ? `Selected the first ${fmt.num(k.item_ids.length)} of ${fmt.num(k.total)}` : `Selected all ${fmt.num(k.item_ids.length)}`, k.capped ? "warn" : "ok");
       } }, `Select all ${fmt.num(res.total)} matching`);
     }
 
-    async function load(keepScroll = false, refresh = false) {
+    async function load(refresh = false) {
+      const myGen = ++loadGen;
       if (!res) mount(body, h("div", { class: "skel" }, h("div"), h("div"), h("div")));
-      res = await api("/api/recovery" + qs({ ...params(), offset: state.offset, limit: state.limit, refresh: refresh ? 1 : "" }));
-      if (!root.isConnected) return;
+      let next;
+      try { next = await api("/api/recovery" + qs({ ...params(), offset: state.offset, limit: state.limit, refresh: refresh ? 1 : "" })); }
+      catch (e) { if (myGen === loadGen && root.isConnected) mount(body, h("div", { class: "notice bad" }, e.message)); return; }
+      if (myGen !== loadGen || !root.isConnected) return;
+      res = next;
       paintHead();
-      mount(body, filters(), albumCards(),
+      paintFilterControls();
+      mount(body, albumCards(),
         h("div", { class: "row between mb" }, h("span", { class: "muted small" },
           res.total ? `${fmt.num(res.total)} track${res.total === 1 ? "" : "s"} · ${fmt.bytes(res.bytes)}` : ""), selectAll()),
         trackTable(), pager());

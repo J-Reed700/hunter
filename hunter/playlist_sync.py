@@ -1,34 +1,28 @@
-"""Mirror Spotify playlists into Navidrome via the Subsonic API.
+"""Mirror Spotify playlists and create curated playlists in Navidrome.
 
 For each (non-excluded) Spotify playlist: match its tracks to Navidrome
 songs by search3 + normalized title/artist + duration tolerance, then
-create-or-replace a Navidrome playlist via POST /rest/createPlaylist
-(form-encoded so 500+ track playlists never hit HTTP 414).
+create-or-replace an owned Navidrome playlist via ``SubsonicClient``.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
-import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from hunter.config import HunterConfig
 from hunter.domain import norm_artist, normalize
-from hunter.http_client import HttpError, HttpSession, default_user_agent
-from hunter.spotify import SpPlaylist, SpTrack
+from hunter.spotify import SpAlbum, SpPlaylist, SpTrack
 from hunter.state import HunterState
+from hunter.subsonic import HTTP_TIMEOUT, SubsonicClient, SubsonicError
 
 log = logging.getLogger(__name__)
 
-HTTP_TIMEOUT = 30
 DURATION_TOLERANCE_S = 7
-
-
-class SubsonicError(RuntimeError):
-    pass
+_MAX_CONSECUTIVE_LOOKUP_ERRORS = 3
 
 
 class SpotifySource(Protocol):
@@ -43,112 +37,6 @@ class MirrorStats:
     tracks_matched: int = 0
     lookups: int = 0
     errors: int = 0
-
-
-class SubsonicClient:
-    def __init__(self, url: str, user: str, password: str, *, timeout: float = HTTP_TIMEOUT):
-        self.url = url.rstrip("/")
-        self.user = user
-        self.password = password
-        self._http = HttpSession(
-            timeout=timeout,
-            user_agent=default_user_agent(component="subsonic"),
-        )
-
-    def __enter__(self) -> "SubsonicClient":
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self._http.close()
-
-    def _auth(self) -> dict[str, str]:
-        salt = secrets.token_hex(8)
-        token = hashlib.md5((self.password + salt).encode("utf-8")).hexdigest()
-        return {"u": self.user, "t": token, "s": salt}
-
-    def _call(self, endpoint: str, params: dict[str, Any], *, method: str = "GET") -> dict:
-        merged: dict[str, Any] = {
-            **self._auth(),
-            "v": "1.16.1",
-            "c": "hunter",
-            "f": "json",
-            **params,
-        }
-        url = f"{self.url}/rest/{endpoint}"
-        try:
-            if method.upper() == "POST":
-                data = self._http.post_json(url, data=merged)
-            else:
-                data = self._http.get_json(url, params=merged)
-        except HttpError as exc:
-            # Never embed full URL (which may carry auth query params).
-            raise SubsonicError(f"subsonic {endpoint}: {type(exc).__name__}") from None
-        if not isinstance(data, dict):
-            raise SubsonicError(f"subsonic {endpoint}: invalid response")
-        body = data.get("subsonic-response")
-        if not isinstance(body, dict):
-            raise SubsonicError(f"subsonic {endpoint}: missing subsonic-response")
-        if body.get("status") != "ok":
-            raise SubsonicError(f"subsonic {endpoint}: {body.get('error')}")
-        return body
-
-    def search_songs(self, query: str, count: int = 20) -> list[dict]:
-        body = self._call(
-            "search3",
-            {
-                "query": query,
-                "songCount": count,
-                "artistCount": 0,
-                "albumCount": 0,
-            },
-        )
-        sr = body.get("searchResult3")
-        songs = sr.get("song") if isinstance(sr, dict) else []
-        if isinstance(songs, dict):
-            return [songs]
-        return [s for s in (songs or []) if isinstance(s, dict)]
-
-    def playlists_multi(self) -> dict[str, list[str]]:
-        """Return ``{playlist_name: [id1, id2, ...]}`` preserving duplicates."""
-        body = self._call("getPlaylists", {})
-        pls_obj = body.get("playlists")
-        pls = pls_obj.get("playlist") if isinstance(pls_obj, dict) else []
-        if isinstance(pls, dict):
-            pls = [pls]
-        out: dict[str, list[str]] = {}
-        for p in pls or []:
-            if not isinstance(p, dict):
-                continue
-            name = p.get("name")
-            pid = p.get("id")
-            if name is not None and pid is not None:
-                out.setdefault(str(name), []).append(str(pid))
-        return out
-
-    def playlists(self) -> dict[str, str]:
-        return {name: ids[-1] for name, ids in self.playlists_multi().items() if ids}
-
-    def create_or_replace(
-        self,
-        name: str,
-        song_ids: list[str],
-        existing_id: str | None = None,
-    ) -> str | None:
-        """Create or replace a Navidrome playlist via POST form data (avoids
-        HTTP 414 on large playlists). Returns the Navidrome playlist ID."""
-        params: dict[str, Any] = {"songId": song_ids}
-        if existing_id:
-            params["playlistId"] = existing_id
-        else:
-            params["name"] = name
-        body = self._call("createPlaylist", params, method="POST")
-        pl = body.get("playlist")
-        if isinstance(pl, dict) and pl.get("id") is not None:
-            return str(pl["id"])
-        return existing_id
 
 
 # Split multi-artist credits without breaking band names like "Florence and the
@@ -195,7 +83,7 @@ def _artists_overlap(want: set[str], have: set[str]) -> bool:
 def match_song(track: SpTrack, songs: list[dict]) -> str | None:
     """Exact match first (title + primary artist + duration); otherwise a
     relaxed match tolerating multi-artist strings and feat./remaster noise,
-    guarded by the duration window."""
+    guarded by the duration window when durations are known."""
     want_title = normalize(track.title)
     want_artist = norm_artist(track.artist)
     want_key = _title_key(track.title)
@@ -205,17 +93,26 @@ def match_song(track: SpTrack, songs: list[dict]) -> str | None:
     if want_artist:
         want_artists = want_artists | {want_artist}
 
-    relaxed: list[tuple[int, str]] = []
+    relaxed: list[tuple[int, int, str]] = []
     for s in songs:
         if not isinstance(s, dict) or s.get("id") is None:
             continue
         title = s.get("title") or ""
         artist = s.get("artist") or ""
-        dur = int(s.get("duration") or 0)
-        delta = abs(dur - track.duration_s) if (track.duration_s and dur) else 0
-        if delta > DURATION_TOLERANCE_S:
+        try:
+            dur = int(s.get("duration") or 0)
+        except (TypeError, ValueError):
+            dur = 0
+        has_both_dur = bool(track.duration_s and dur)
+        delta = abs(dur - track.duration_s) if has_both_dur else 0
+        if has_both_dur and delta > DURATION_TOLERANCE_S:
             continue
-        if want_title and want_artist and normalize(title) == want_title and norm_artist(artist) == want_artist:
+        if (
+            want_title
+            and want_artist
+            and normalize(title) == want_title
+            and norm_artist(artist) == want_artist
+        ):
             return str(s["id"])
         if not want_key or _title_key(title) != want_key:
             continue
@@ -225,16 +122,12 @@ def match_song(track: SpTrack, songs: list[dict]) -> str | None:
             have_artists = have_artists | {have_artist}
         if not _artists_overlap(want_artists, have_artists):
             continue
-        if not (track.duration_s and dur):
-            continue
-        relaxed.append((delta, str(s["id"])))
+        # Prefer matches with confirmed duration proximity over unknown-duration matches.
+        relaxed.append((0 if has_both_dur else 1, delta, str(s["id"])))
     if relaxed:
         relaxed.sort()
-        return relaxed[0][1]
+        return relaxed[0][2]
     return None
-
-
-_match_song = match_song
 
 
 def _resolve_track_checked(
@@ -242,7 +135,7 @@ def _resolve_track_checked(
     state: HunterState,
     track: SpTrack,
     *,
-    miss_retry_s: int = 7 * 86_400,
+    miss_retry_s: int = 259_200,
 ) -> tuple[str | None, bool, bool]:
     """Return ``(song_id, did_lookup, failed)``. Cache-first; falls back to
     title-only search whenever ``title artist`` returns no match."""
@@ -267,13 +160,170 @@ def resolve_track(
     state: HunterState,
     track: SpTrack,
     *,
-    miss_retry_s: int = 7 * 86_400,
+    miss_retry_s: int = 259_200,
 ) -> tuple[str | None, bool]:
     """Return ``(song_id, did_lookup)``."""
     song_id, did, _failed = _resolve_track_checked(
         subsonic, state, track, miss_retry_s=miss_retry_s
     )
     return song_id, did
+
+
+def _load_owned_playlists(state: HunterState) -> dict[str, str]:
+    try:
+        raw = json.loads(state.get_meta("nd_playlists", "{}"))
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _save_owned_playlists(state: HunterState, owned: dict[str, str]) -> None:
+    state.set_meta("nd_playlists", json.dumps(owned))
+
+
+def _resolve_owned_playlist(
+    name: str,
+    existing_multi: dict[str, list[str]],
+    owned_pls: dict[str, str],
+    *,
+    overwrite: bool = False,
+) -> tuple[str | None, bool]:
+    """Return ``(existing_id, conflict)`` for writing a playlist named *name*.
+
+    ``conflict`` is True when a non-Hunter playlist with *name* exists and
+    *overwrite* is False.
+    """
+    all_ids = existing_multi.get(name, [])
+    owned_id = owned_pls.get(name)
+    if owned_id and owned_id in all_ids:
+        return owned_id, False
+    if all_ids:
+        if overwrite:
+            return all_ids[-1], False
+        return None, True
+    return None, False
+
+
+def _persist_new_playlist_ownership(
+    subsonic: SubsonicClient,
+    state: HunterState,
+    name: str,
+    new_id: str | None,
+    owned_pls: dict[str, str],
+    existing_multi: dict[str, list[str]],
+) -> str | None:
+    resolved_id = new_id
+    if not resolved_id:
+        try:
+            resolved_id = subsonic.playlists_multi().get(name, [None])[-1]
+        except SubsonicError as exc:
+            log.warning("playlist %r created but ID lookup failed: %s", name, exc)
+            return None
+    if resolved_id:
+        owned_pls[name] = resolved_id
+        existing_multi.setdefault(name, []).append(resolved_id)
+        _save_owned_playlists(state, owned_pls)
+    return resolved_id
+
+
+def create_navidrome_playlist(
+    cfg: HunterConfig,
+    name: str,
+    *,
+    song_ids: list[str] | None = None,
+    tracks: list[tuple[str, str]] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Create or update a Navidrome playlist safely (respecting ownership).
+
+    Accepts either pre-resolved Navidrome ``song_ids`` OR ``(artist, title)``
+    pairs to search via Subsonic. Never holds ``HunterState`` open across
+    network calls.
+    """
+    if not cfg.navidrome_user:
+        return {"ok": False, "status": 400, "error": "Navidrome not configured"}
+    clean_name = (name or "").strip()
+    if not clean_name:
+        return {"ok": False, "status": 400, "error": "playlist name required"}
+
+    with HunterState(cfg.state_db) as st:
+        owned_pls = _load_owned_playlists(st)
+
+    try:
+        with SubsonicClient(cfg.navidrome_url, cfg.navidrome_user, cfg.navidrome_pass) as sub:
+            existing_multi = sub.playlists_multi()
+            existing_id, conflict = _resolve_owned_playlist(
+                clean_name, existing_multi, owned_pls, overwrite=overwrite
+            )
+            if conflict:
+                return {
+                    "ok": False,
+                    "status": 409,
+                    "error": (
+                        f"playlist {clean_name!r} already exists in Navidrome "
+                        "and was not created by hunter — pass overwrite=true to replace it"
+                    ),
+                }
+
+            resolved_ids: list[str] = []
+            missed: list[str] = []
+            if song_ids is not None:
+                resolved_ids = [str(s) for s in song_ids if s]
+            elif tracks is not None:
+                seen_ids: set[str] = set()
+                for artist, title in tracks[:300]:
+                    if not title:
+                        continue
+                    fake = SpTrack(
+                        id="",
+                        title=title,
+                        artist=artist,
+                        duration_s=0,
+                        album=SpAlbum("", artist, "", 0, 0),
+                    )
+                    q = f"{title} {artist}".strip()
+                    sid = match_song(fake, sub.search_songs(q))
+                    if sid is None and artist:
+                        sid = match_song(fake, sub.search_songs(title))
+                    if sid and sid not in seen_ids:
+                        seen_ids.add(sid)
+                        resolved_ids.append(sid)
+                    elif not sid:
+                        missed.append(f"{artist} — {title}" if artist else title)
+
+            if not resolved_ids:
+                return {
+                    "ok": False,
+                    "status": 404,
+                    "error": "none of those tracks matched in Navidrome",
+                }
+
+            new_id = sub.create_or_replace(clean_name, resolved_ids, existing_id)
+            if not existing_id and not new_id:
+                try:
+                    new_id = sub.playlists_multi().get(clean_name, [None])[-1]
+                except SubsonicError:
+                    new_id = None
+    except SubsonicError as exc:
+        return {"ok": False, "status": 502, "error": f"navidrome: {exc}"}
+
+    if new_id:
+        with HunterState(cfg.state_db) as st:
+            fresh_owned = _load_owned_playlists(st)
+            fresh_owned[clean_name] = new_id
+            _save_owned_playlists(st, fresh_owned)
+
+    total_in = len(song_ids) if song_ids is not None else len(tracks or ())
+    return {
+        "ok": True,
+        "name": clean_name,
+        "matched": len(resolved_ids),
+        "tracks": len(resolved_ids),
+        "total": total_in,
+        "missed": len(missed),
+        "missed_sample": missed[:15],
+        "replaced": bool(existing_id),
+    }
 
 
 def mirror_playlists(
@@ -287,16 +337,13 @@ def mirror_playlists(
     apply: bool,
     deadline: float,
     allowed_ids: set[str] | None = None,
-    miss_retry_s: int = 7 * 86_400,
+    miss_retry_s: int = 259_200,
 ) -> MirrorStats:
     stats = MirrorStats()
     exclude = re.compile(exclude_re, re.IGNORECASE) if exclude_re else None
     existing_multi = subsonic.playlists_multi()
-    try:
-        owned_raw = json.loads(state.get_meta("nd_playlists", "{}"))
-        owned_pls: dict[str, str] = owned_raw if isinstance(owned_raw, dict) else {}
-    except ValueError:
-        owned_pls = {}
+    owned_pls = _load_owned_playlists(state)
+    seen_target_names: set[str] = set()
 
     for playlist in spotify.playlists():
         if time.time() > deadline:
@@ -307,6 +354,17 @@ def mirror_playlists(
         if allowed_ids is not None and playlist.id not in allowed_ids:
             continue
 
+        name = prefix + playlist.name
+        if name in seen_target_names:
+            log.warning(
+                "duplicate Spotify playlist name %r (id=%s) — skipping second copy "
+                "so it does not overwrite the first",
+                name,
+                playlist.id,
+            )
+            continue
+        seen_target_names.add(name)
+
         try:
             tracks = spotify.playlist_tracks(playlist.id)
         except Exception as exc:                       # noqa: BLE001
@@ -316,8 +374,13 @@ def mirror_playlists(
 
         song_ids: list[str] = []
         truncated = False
+        consec_errors = 0
         for track in tracks:
-            if stats.lookups >= lookup_cap or time.time() > deadline:
+            if (
+                stats.lookups >= lookup_cap
+                or time.time() > deadline
+                or consec_errors >= _MAX_CONSECUTIVE_LOOKUP_ERRORS
+            ):
                 cached, song_id = state.get_track_match(
                     track.id, miss_retry_s=miss_retry_s
                 )
@@ -330,6 +393,10 @@ def mirror_playlists(
                 )
                 if failed:
                     truncated = True
+                    stats.errors += 1
+                    consec_errors += 1
+                else:
+                    consec_errors = 0
             stats.lookups += did
             if song_id:
                 song_ids.append(song_id)
@@ -338,10 +405,9 @@ def mirror_playlists(
         stats.tracks_total += len(tracks)
         stats.tracks_matched += len(song_ids)
 
-        name = prefix + playlist.name
         if truncated:
             log.info(
-                "playlist %r: resolution cut short by cap/deadline — skipping write "
+                "playlist %r: resolution cut short by cap/deadline/error — skipping write "
                 "to avoid truncating Navidrome playlist",
                 name,
             )
@@ -350,11 +416,8 @@ def mirror_playlists(
             log.info("playlist %r: 0/%d matched — skipping write", name, len(tracks))
             continue
 
-        all_ids = existing_multi.get(name, [])
-        owned_id = owned_pls.get(name)
-        if owned_id and owned_id in all_ids:
-            existing_id: str | None = owned_id
-        elif all_ids:
+        existing_id, conflict = _resolve_owned_playlist(name, existing_multi, owned_pls)
+        if conflict:
             log.warning(
                 "playlist %r exists in Navidrome but hunter didn't create it — "
                 "refusing to overwrite (rename the Spotify playlist or set "
@@ -362,27 +425,28 @@ def mirror_playlists(
                 name,
             )
             continue
-        else:
-            existing_id = None
 
         if apply:
             try:
                 new_id = subsonic.create_or_replace(name, song_ids, existing_id)
                 log.info("playlist %r: wrote %d/%d tracks", name, len(song_ids), len(tracks))
                 if not existing_id:
-                    if not new_id:
-                        new_id = subsonic.playlists_multi().get(name, [None])[-1]
-                    if new_id:
-                        owned_pls[name] = new_id
-                        existing_multi.setdefault(name, []).append(new_id)
-                        state.set_meta("nd_playlists", json.dumps(owned_pls))
+                    _persist_new_playlist_ownership(
+                        subsonic, state, name, new_id, owned_pls, existing_multi
+                    )
             except SubsonicError as exc:
                 stats.errors += 1
                 log.warning("playlist %r write failed: %s", name, exc)
                 err_s = str(exc).lower()
-                if ("not found" in err_s or "'code': 70" in err_s or '"code": 70' in err_s) and hasattr(state, "invalidate_track_match"):
-                    for t in tracks:
-                        state.invalidate_track_match(t.id)
+                if (
+                    exc.code == 70
+                    or "not found" in err_s
+                    or "'code': 70" in err_s
+                    or '"code": 70' in err_s
+                ) and hasattr(state, "invalidate_track_match"):
+                    with state.transaction():
+                        for t in tracks:
+                            state.invalidate_track_match(t.id)
         else:
             log.info(
                 "[dry-run] playlist %r: would write %d/%d tracks",
@@ -391,3 +455,17 @@ def mirror_playlists(
                 len(tracks),
             )
     return stats
+
+
+__all__ = [
+    "DURATION_TOLERANCE_S",
+    "HTTP_TIMEOUT",
+    "MirrorStats",
+    "SpotifySource",
+    "SubsonicClient",
+    "SubsonicError",
+    "create_navidrome_playlist",
+    "match_song",
+    "mirror_playlists",
+    "resolve_track",
+]

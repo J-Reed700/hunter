@@ -7,7 +7,6 @@ persisted via config.save_spotify_token (atomic 0o600 merge-write).
 """
 from __future__ import annotations
 
-import base64
 import email.utils
 import hashlib
 import hmac
@@ -16,11 +15,14 @@ import logging
 import os
 import struct
 import time
+import urllib.parse
+from datetime import timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from hunter import config
+from hunter.domain import extract_year
 from hunter.http_client import (
     HttpError,
     HttpSession,
@@ -31,7 +33,10 @@ from hunter.http_client import (
 log = logging.getLogger(__name__)
 
 API = "https://api.spotify.com/v1"
+AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
+OAUTH_REDIRECT_URI = "http://127.0.0.1:8888/callback"
+OAUTH_SCOPES = "user-library-read playlist-read-private playlist-read-collaborative"
 HTTP_TIMEOUT = 30
 MAX_PAGES = 40          # 40 * 50 items — bound runaway pagination
 
@@ -40,8 +45,162 @@ _TOTP_VER = 61
 _TOTP_CIPHER = [44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97,
                 75, 76, 94, 102, 43, 69, 49, 120, 118, 80, 64, 78]
 
-_WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-           " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+          " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+_WEB_UA = WEB_UA
+
+# Max in-request sleep on HTTP 429 before failing fast with the full server Retry-After.
+_MAX_IN_REQUEST_RL_SLEEP = 90.0
+_FAIL_FAST_RL_THRESHOLD = 120.0
+_MAX_RETRY_AFTER_REPORT = 86_400.0
+
+
+def oauth_authorize_url(client_id: str, *, state: str = "") -> str:
+    """Build the Spotify OAuth authorization URL (shared by CLI & Web UI)."""
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "scope": OAUTH_SCOPES,
+    }
+    if state:
+        params["state"] = state
+    return f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
+
+
+def extract_oauth_code(raw: str) -> str:
+    """Extract the authorization ``code`` from either a pasted callback URL or raw code."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if "code=" in s:
+        parsed = urllib.parse.urlparse(s)
+        vals = urllib.parse.parse_qs(parsed.query).get("code")
+        if vals and vals[0]:
+            return vals[0].strip()
+    return s
+
+
+def oauth_exchange_code(
+    client_id: str,
+    client_secret: str,
+    code_or_url: str,
+    *,
+    cfg: Any = None,
+    proxy: str = "",
+) -> dict[str, Any]:
+    """Exchange a Spotify OAuth authorization code for tokens (shared by CLI & Web UI)."""
+    code = extract_oauth_code(code_or_url)
+    if not code:
+        raise SpotifyError("no authorization code provided")
+    with HttpSession(
+        timeout=HTTP_TIMEOUT,
+        user_agent=default_user_agent(cfg, component="spotify"),
+        proxy=proxy or None,
+    ) as http:
+        try:
+            resp = http.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": OAUTH_REDIRECT_URI,
+                },
+                auth=(client_id, client_secret),
+                timeout=HTTP_TIMEOUT,
+                raise_for_status=False,
+            )
+        except HttpError as exc:
+            raise SpotifyError(f"token exchange failed: {exc}") from exc
+        if resp.status_code != 200:
+            raise SpotifyError(f"token exchange failed: {resp.status_code} {resp.text[:200]}")
+        try:
+            tok = resp.json()
+        except ValueError as exc:
+            raise SpotifyError(f"token exchange invalid JSON: {exc}") from exc
+    if not isinstance(tok, dict) or not tok.get("refresh_token"):
+        raise SpotifyError("token exchange response missing refresh_token")
+    return tok
+
+
+def paced_spotify_call(
+    *,
+    label: str,
+    attempts: int,
+    pace_floor: float,
+    get_pace: Callable[[], float],
+    set_pace: Callable[[float], None],
+    get_last_call: Callable[[], float],
+    set_last_call: Callable[[float], None],
+    get_token: Callable[[bool], str],
+    do_request: Callable[[str], Any],
+    on_non_200: Callable[[Any], Any] | None = None,
+) -> Any:
+    """Shared adaptive pacing + 429 Retry-After + single 401 refresh loop for
+    both Spotify Web API (``SpotifyClient``) and Pathfinder GraphQL (``SpotifyGQL``)."""
+    tried_401 = False
+    last_ra: float | None = None
+    last_status: int | None = None
+
+    for attempt in range(max(1, int(attempts))):
+        last_call = get_last_call()
+        if last_call > 0.0:
+            gap = get_pace() - (time.monotonic() - last_call)
+            if gap > 0:
+                time.sleep(gap)
+        token = get_token(False)
+        try:
+            resp = do_request(token)
+        except HttpError as exc:
+            raise SpotifyError(f"{label}: {exc}") from exc
+        set_last_call(time.monotonic())
+        last_status = resp.status_code
+
+        if resp.status_code == 429:
+            raw_ra = parse_retry_after(
+                resp.headers.get("Retry-After"),
+                default=5.0,
+                cap=_MAX_RETRY_AFTER_REPORT,
+            )
+            last_ra = raw_ra
+            if raw_ra > _FAIL_FAST_RL_THRESHOLD:
+                set_pace(min(max(get_pace() * 1.5, _MAX_IN_REQUEST_RL_SLEEP), _MAX_IN_REQUEST_RL_SLEEP))
+                raise SpotifyRateLimitError(
+                    f"{label}: rate-limited (Retry-After {int(raw_ra)}s — failing fast)",
+                    retry_after=raw_ra,
+                )
+            wait = min(raw_ra, _MAX_IN_REQUEST_RL_SLEEP)
+            set_pace(min(max(get_pace() * 1.5, wait), _MAX_IN_REQUEST_RL_SLEEP))
+            log.info(
+                "%s 429 — pace floor now %.1fs [%d/%d]",
+                label,
+                get_pace(),
+                attempt + 1,
+                attempts,
+            )
+            continue
+
+        if resp.status_code == 401 and not tried_401:
+            tried_401 = True
+            get_token(True)
+            continue
+
+        if resp.status_code != 200:
+            if on_non_200 is not None:
+                handled = on_non_200(resp)
+                if handled is not None:
+                    return handled
+            raise SpotifyError(f"{label}: {resp.status_code} {resp.text[:200]}")
+
+        set_pace(max(pace_floor, get_pace() * 0.9))
+        return resp
+
+    if last_status == 429:
+        raise SpotifyRateLimitError(
+            f"{label}: rate-limited past {attempts} retries (Spotify web-token quota)",
+            retry_after=last_ra,
+        )
+    raise SpotifyError(f"{label}: exhausted retries (HTTP {last_status})")
 
 
 @dataclass(frozen=True)
@@ -100,15 +259,16 @@ def _first_artist_name(raw_artists: Any) -> str:
 def _album_from_json(a: dict | None) -> SpAlbum:
     if not isinstance(a, dict):
         return SpAlbum(id="", artist="", name="", year=0, total_tracks=0)
-    date = str(a.get("release_date") or "")
-    y = date[:4]
-    year = int(y) if len(y) == 4 and y.isdigit() else 0
+    try:
+        total = int(a.get("total_tracks") or 0)
+    except (TypeError, ValueError):
+        total = 0
     return SpAlbum(
         id=str(a.get("id") or ""),
         artist=_first_artist_name(a.get("artists")),
         name=str(a.get("name") or ""),
-        year=year,
-        total_tracks=int(a.get("total_tracks") or 0),
+        year=extract_year(a.get("release_date")),
+        total_tracks=total,
     )
 
 
@@ -169,9 +329,7 @@ class SpotifyClient:
         """(6-digit code, version) from the current secret cipher, RFC-6238
         over 30s windows, keyed by Spotify's own server clock."""
         transformed = [e ^ ((t % 33) + 9) for t, e in enumerate(_TOTP_CIPHER)]
-        hex_str = "".join(str(n) for n in transformed).encode().hex()
-        secret = base64.b32encode(bytes.fromhex(hex_str)).decode().rstrip("=")
-        key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+        key = "".join(str(n) for n in transformed).encode()
         counter = struct.pack(">Q", int(server_ts // 30))
         h = hmac.new(key, counter, hashlib.sha1).digest()
         off = h[-1] & 0x0F
@@ -185,11 +343,13 @@ class SpotifyClient:
             resp = mint.request(
                 "HEAD",
                 "https://open.spotify.com/",
-                headers={"User-Agent": _WEB_UA},
+                headers={"User-Agent": WEB_UA},
                 timeout=HTTP_TIMEOUT,
                 raise_for_status=False,
             )
             dt = email.utils.parsedate_to_datetime(resp.headers["Date"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
         except Exception:
             return time.time()
@@ -199,12 +359,12 @@ class SpotifyClient:
         # collide with our explicit sp_dc header.
         with HttpSession(
             timeout=HTTP_TIMEOUT,
-            user_agent=_WEB_UA,
+            user_agent=WEB_UA,
             proxy=self._proxy or None,
         ) as mint:
             headers = {
                 "Cookie": f"sp_dc={sp_dc}",
-                "User-Agent": _WEB_UA,
+                "User-Agent": WEB_UA,
                 "Accept": "application/json",
                 "Referer": "https://open.spotify.com/",
                 "App-Platform": "WebPlayer",
@@ -218,7 +378,7 @@ class SpotifyClient:
                     # "transport" failed, advance to the next window on retry.
                     server_ts = server_ts + 30.0
                 prev_ts = server_ts
-                mint._session.cookies.clear()
+                mint.clear_cookies()
                 otp, ver = self._totp(server_ts)
                 try:
                     resp = mint.get(
@@ -248,7 +408,10 @@ class SpotifyClient:
                         self._access_token = str(tok["accessToken"])
                         expiry_ms = tok.get("accessTokenExpirationTimestampMs")
                         if expiry_ms:
-                            delta = max(60.0, (float(expiry_ms) / 1000.0) - time.time() - 60.0)
+                            try:
+                                delta = max(60.0, (float(expiry_ms) / 1000.0) - time.time() - 60.0)
+                            except (TypeError, ValueError):
+                                delta = 1800.0
                             self._expires_at = time.monotonic() + delta
                         else:
                             self._expires_at = time.monotonic() + 1800.0
@@ -312,84 +475,50 @@ class SpotifyClient:
             self._refresh()
         return self._access_token
 
-    def _token(self) -> str:
-        return self.get_access_token()
-
     def me(self) -> dict:
         """Profile of the authenticated user — the auth smoke test."""
         return self._get("/me")
 
     def playlist_info(self, playlist_id: str) -> SpPlaylist:
-        p = self._get(f"/playlists/{playlist_id}", {"fields": "id,name,tracks(total)"})
+        pid_q = urllib.parse.quote(str(playlist_id), safe="")
+        p = self._get(f"/playlists/{pid_q}", {"fields": "id,name,tracks(total)"})
+        pid = str(p.get("id") or playlist_id)
+        try:
+            total = int((p.get("tracks") or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
         return SpPlaylist(
-            id=p["id"],
-            name=p.get("name") or p["id"],
-            track_count=int((p.get("tracks") or {}).get("total") or 0),
+            id=pid,
+            name=str(p.get("name") or pid),
+            track_count=total,
         )
 
     def _get(self, url: str, params: dict | None = None) -> dict:
-        tried_401 = False
-        last_ra: float | None = None
-        last_status: int | None = None
-        for attempt in range(self._RL_ATTEMPTS):
-            if self._last_call > 0.0:
-                gap = self._pace - (time.monotonic() - self._last_call)
-                if gap > 0:
-                    time.sleep(gap)
-            token = self.get_access_token()
-            try:
-                resp = self._http.get(
-                    url if url.startswith("http") else API + url,
-                    params=params,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=HTTP_TIMEOUT,
-                    raise_for_status=False,
-                )
-            except HttpError as exc:
-                raise SpotifyError(f"GET {url}: {exc}") from exc
-            self._last_call = time.monotonic()
-            last_status = resp.status_code
-
-            if resp.status_code == 429:
-                wait = parse_retry_after(
-                    resp.headers.get("Retry-After"), default=5.0, cap=90.0
-                )
-                last_ra = wait
-                self._pace = min(max(self._pace * 1.5, wait), 90.0)
-                log.info(
-                    "spotify 429 — pace floor now %.1fs [%d/%d]",
-                    self._pace,
-                    attempt + 1,
-                    self._RL_ATTEMPTS,
-                )
-                continue
-
-            if resp.status_code == 401 and not tried_401:
-                tried_401 = True
-                self.get_access_token(force_refresh=True)
-                continue
-
-            if resp.status_code != 200:
-                raise SpotifyError(
-                    f"GET {url}: {resp.status_code} {resp.text[:200]}"
-                )
-
-            self._pace = max(self._RL_PACE, self._pace * 0.9)
-            try:
-                data = resp.json()
-            except ValueError as exc:
-                raise SpotifyError(f"GET {url}: invalid JSON ({exc})") from exc
-            if not isinstance(data, dict):
-                raise SpotifyError(f"GET {url}: expected JSON object")
-            return data
-
-        if last_status == 429:
-            raise SpotifyRateLimitError(
-                f"GET {url}: rate-limited past {self._RL_ATTEMPTS} retries "
-                "(Spotify web-token quota)",
-                retry_after=last_ra,
-            )
-        raise SpotifyError(f"GET {url}: exhausted retries (HTTP {last_status})")
+        full_url = url if url.startswith("http") else API + url
+        resp = paced_spotify_call(
+            label=f"GET {url}",
+            attempts=self._RL_ATTEMPTS,
+            pace_floor=self._RL_PACE,
+            get_pace=lambda: self._pace,
+            set_pace=lambda v: setattr(self, "_pace", v),
+            get_last_call=lambda: self._last_call,
+            set_last_call=lambda v: setattr(self, "_last_call", v),
+            get_token=self.get_access_token,
+            do_request=lambda token: self._http.get(
+                full_url,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=HTTP_TIMEOUT,
+                raise_for_status=False,
+            ),
+        )
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise SpotifyError(f"GET {url}: invalid JSON ({exc})") from exc
+        if not isinstance(data, dict):
+            raise SpotifyError(f"GET {url}: expected JSON object")
+        return data
 
     def _paginate(self, url: str, params: dict | None = None) -> list[dict]:
         items: list[dict] = []
@@ -434,14 +563,17 @@ class SpotifyClient:
         ]
 
     def album(self, album_id: str) -> SpAlbum:
-        return _album_from_json(self._get(f"/albums/{album_id}"))
+        aid_q = urllib.parse.quote(str(album_id), safe="")
+        return _album_from_json(self._get(f"/albums/{aid_q}"))
 
     def track_album(self, track_id: str) -> SpAlbum:
-        return _album_from_json(self._get(f"/tracks/{track_id}").get("album"))
+        tid_q = urllib.parse.quote(str(track_id), safe="")
+        return _album_from_json(self._get(f"/tracks/{tid_q}").get("album"))
 
     def playlist_tracks(self, playlist_id: str) -> list[SpTrack]:
+        pid_q = urllib.parse.quote(str(playlist_id), safe="")
         raw = self._paginate(
-            f"/playlists/{playlist_id}/tracks",
+            f"/playlists/{pid_q}/tracks",
             {
                 "limit": 50,
                 "fields": (

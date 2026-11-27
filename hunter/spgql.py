@@ -10,23 +10,25 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
 
 import requests
 
-from hunter.domain import atomic_write_json
-from hunter.http_client import HttpError, HttpSession, parse_retry_after
-from hunter.spotify import SpotifyClient, SpotifyError, SpotifyRateLimitError
+from hunter.domain import atomic_write_json, extract_year
+from hunter.http_client import HttpError, HttpSession
+from hunter.spotify import (
+    WEB_UA,
+    SpotifyClient,
+    SpotifyError,
+    paced_spotify_call,
+)
 
 log = logging.getLogger(__name__)
 
 GQL_URL = "https://api-partner.spotify.com/pathfinder/v2/query"
 OPEN_URL = "https://open.spotify.com/"
-WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-          " (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 _OP_RE = re.compile(r'new \w+\.\w+\("(\w+)","(?:query|mutation)",'
                     r'"([0-9a-f]{64})"')
 HTTP_TIMEOUT = 30
@@ -38,6 +40,24 @@ OP_LIKED = "fetchLibraryTracks"     # liked songs
 OP_PLAYLIST = "fetchPlaylist"       # one playlist's contents
 
 PAGE_SIZE = 50
+
+
+def _as_dict(obj: Any, *keys: str) -> dict:
+    cur: Any = obj
+    for k in keys:
+        if not isinstance(cur, dict):
+            return {}
+        cur = cur.get(k)
+    return cur if isinstance(cur, dict) else {}
+
+
+def _as_int(val: Any, default: int = 0) -> int:
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _is_allowed_bundle_url(url: str) -> bool:
@@ -113,6 +133,10 @@ class SpotifyGQL:
             return None
         try:
             if resp.status_code != 200:
+                return None
+            final_url = getattr(resp, "url", None)
+            if isinstance(final_url, str) and final_url and not _is_allowed_bundle_url(final_url):
+                log.warning("skipping redirected untrusted bundle URL: %s", final_url)
                 return None
             cl = (resp.headers or {}).get("Content-Length")
             if cl:
@@ -207,107 +231,80 @@ class SpotifyGQL:
             self._get_ops(refresh=True)
             return self._query(op, variables, _refreshed=True)
 
-        tried_401 = False
-        last_ra: float | None = None
-        last_status: int | None = None
-        for attempt in range(self._rl_attempts):
-            if self._last_call > 0.0:
-                gap = self._pace - (time.monotonic() - self._last_call)
-                if gap > 0:
-                    time.sleep(gap)
-            token = self._spotify.get_access_token()
-            try:
-                resp = self._http.post(
-                    GQL_URL,
-                    json={
-                        "operationName": op,
-                        "variables": variables,
-                        "extensions": {
-                            "persistedQuery": {
-                                "version": 1,
-                                "sha256Hash": ops[op],
-                            }
-                        },
-                    },
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "User-Agent": WEB_UA,
-                        "App-Platform": "WebPlayer",
-                        "Origin": "https://open.spotify.com",
-                        "Referer": "https://open.spotify.com/",
-                    },
-                    timeout=HTTP_TIMEOUT,
-                    raise_for_status=False,
-                )
-            except HttpError as exc:
-                raise SpotifyError(f"pathfinder {op}: {exc}") from exc
-            self._last_call = time.monotonic()
-            last_status = resp.status_code
+        refresh_needed = False
 
-            if resp.status_code == 429:
-                wait = parse_retry_after(
-                    resp.headers.get("Retry-After"), default=5.0, cap=90.0
-                )
-                last_ra = wait
-                self._pace = min(max(self._pace * 1.5, wait), 90.0)
-                log.info(
-                    "pathfinder 429 — pace floor now %.1fs [%d/%d]",
-                    self._pace,
-                    attempt + 1,
-                    self._rl_attempts,
-                )
-                continue
-
-            if resp.status_code == 401 and not tried_401:
-                tried_401 = True
-                self._spotify.get_access_token(force_refresh=True)
-                continue
-
+        def _handle_non_200(resp: Any) -> Any:
+            nonlocal refresh_needed
             if resp.status_code in (400, 404) and not _refreshed:
                 log.info(
                     "persisted query %s rejected (%s) — refreshing hashes",
                     op,
                     resp.status_code,
                 )
+                refresh_needed = True
+                return resp
+            return None
+
+        resp = paced_spotify_call(
+            label=f"pathfinder {op}",
+            attempts=self._rl_attempts if not _refreshed else max(1, self._rl_attempts // 2),
+            pace_floor=0.8,
+            get_pace=lambda: self._pace,
+            set_pace=lambda v: setattr(self, "_pace", v),
+            get_last_call=lambda: self._last_call,
+            set_last_call=lambda v: setattr(self, "_last_call", v),
+            get_token=lambda force: self._spotify.get_access_token(force_refresh=force),
+            do_request=lambda token: self._http.post(
+                GQL_URL,
+                json={
+                    "operationName": op,
+                    "variables": variables,
+                    "extensions": {
+                        "persistedQuery": {
+                            "version": 1,
+                            "sha256Hash": ops[op],
+                        }
+                    },
+                },
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": WEB_UA,
+                    "App-Platform": "WebPlayer",
+                    "Origin": "https://open.spotify.com",
+                    "Referer": "https://open.spotify.com/",
+                },
+                timeout=HTTP_TIMEOUT,
+                raise_for_status=False,
+            ),
+            on_non_200=_handle_non_200,
+        )
+        if refresh_needed:
+            self._get_ops(refresh=True)
+            return self._query(op, variables, _refreshed=True)
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise SpotifyError(
+                f"pathfinder {op}: non-JSON response ({exc})"
+            ) from exc
+        if not isinstance(body, dict):
+            raise SpotifyError(f"pathfinder {op}: expected JSON object")
+
+        if body.get("errors"):
+            if _is_persisted_query_not_found(body["errors"]) and not _refreshed:
+                log.info(
+                    "persisted query %s rejected (PersistedQueryNotFound) — refreshing hashes",
+                    op,
+                )
                 self._get_ops(refresh=True)
                 return self._query(op, variables, _refreshed=True)
-
-            if resp.status_code != 200:
-                raise SpotifyError(
-                    f"pathfinder {op}: {resp.status_code} {resp.text[:200]}"
-                )
-
-            try:
-                body = resp.json()
-            except ValueError as exc:
-                raise SpotifyError(
-                    f"pathfinder {op}: non-JSON response ({exc})"
-                ) from exc
-            if not isinstance(body, dict):
-                raise SpotifyError(f"pathfinder {op}: expected JSON object")
-
-            if body.get("errors"):
-                if _is_persisted_query_not_found(body["errors"]) and not _refreshed:
-                    log.info(
-                        "persisted query %s rejected (PersistedQueryNotFound) — refreshing hashes",
-                        op,
-                    )
-                    self._get_ops(refresh=True)
-                    return self._query(op, variables, _refreshed=True)
-                raise SpotifyError(
-                    f"pathfinder {op}: {json.dumps(body['errors'])[:200]}"
-                )
-
-            self._pace = max(0.8, self._pace * 0.9)
-            data = body.get("data")
-            return data if isinstance(data, dict) else {}
-
-        if last_status == 429:
-            raise SpotifyRateLimitError(
-                f"pathfinder {op}: rate-limited past retries",
-                retry_after=last_ra,
+            raise SpotifyError(
+                f"pathfinder {op}: {json.dumps(body['errors'])[:200]}"
             )
-        raise SpotifyError(f"pathfinder {op}: exhausted retries (HTTP {last_status})")
+
+        data = body.get("data")
+        return data if isinstance(data, dict) else {}
 
     # --- pages ---------------------------------------------------------------
 
@@ -328,17 +325,17 @@ class SpotifyGQL:
                 "includeFoldersWhenFlattening": True,
             },
         )
-        lib = (data.get("me") or {}).get("libraryV3") or {}
+        lib = _as_dict(data, "me", "libraryV3")
         items = lib.get("items") or []
-        return (items if isinstance(items, list) else []), int(lib.get("totalCount") or 0)
+        return (items if isinstance(items, list) else []), _as_int(lib.get("totalCount"))
 
     def liked_page(
         self, offset: int, limit: int = PAGE_SIZE
     ) -> tuple[list[dict], int]:
         data = self._query(OP_LIKED, {"offset": offset, "limit": limit})
-        tracks = ((data.get("me") or {}).get("library") or {}).get("tracks") or {}
+        tracks = _as_dict(data, "me", "library", "tracks")
         items = tracks.get("items") or []
-        return (items if isinstance(items, list) else []), int(tracks.get("totalCount") or 0)
+        return (items if isinstance(items, list) else []), _as_int(tracks.get("totalCount"))
 
     def playlist_page(
         self, playlist_id: str, offset: int, limit: int = 100
@@ -352,9 +349,9 @@ class SpotifyGQL:
                 "enableWatchFeedEntrypoint": False,
             },
         )
-        content = (data.get("playlistV2") or {}).get("content") or {}
+        content = _as_dict(data, "playlistV2", "content")
         items = content.get("items") or []
-        return (items if isinstance(items, list) else []), int(content.get("totalCount") or 0)
+        return (items if isinstance(items, list) else []), _as_int(content.get("totalCount"))
 
 
 # --- item parsers (pathfinder shapes → plain tuples/dicts) -------------------
@@ -393,8 +390,8 @@ def parse_library_playlist(item: dict | None) -> tuple[str, str, str, int] | Non
     owner_data = owner_v2.get("data") if isinstance(owner_v2, dict) else None
     owner = (owner_data.get("name") or "") if isinstance(owner_data, dict) else ""
     contents = d.get("contents")
-    count = (contents.get("totalCount") or 0) if isinstance(contents, dict) else 0
-    return pid, str(d.get("name") or pid), str(owner), int(count)
+    count = _as_int(contents.get("totalCount") if isinstance(contents, dict) else 0)
+    return pid, str(d.get("name") or pid), str(owner), count
 
 
 def parse_library_album(item: dict | None) -> tuple[str, str, str, int] | None:
@@ -414,7 +411,7 @@ def parse_library_album(item: dict | None) -> tuple[str, str, str, int] | None:
     )
     date_obj = d.get("date")
     date = str(date_obj.get("isoString") or "") if isinstance(date_obj, dict) else ""
-    year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else 0
+    year = extract_year(date)
     return aid, artist, str(d.get("name") or ""), year
 
 
@@ -470,21 +467,21 @@ def parse_track(wrapper: dict | None) -> dict | None:
 
     date_obj = album.get("date")
     date = str(date_obj.get("isoString") or "") if isinstance(date_obj, dict) else ""
-    year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else 0
+    year = extract_year(date)
 
     dur_ms = 0
     for key in ("trackDuration", "duration"):
         val = d.get(key)
         if isinstance(val, dict) and val.get("totalMilliseconds"):
-            dur_ms = int(val["totalMilliseconds"])
+            dur_ms = _as_int(val["totalMilliseconds"])
             break
 
     tracks_obj = album.get("tracks")
     album_total = 0
     if isinstance(tracks_obj, dict) and tracks_obj.get("totalCount"):
-        album_total = int(tracks_obj["totalCount"])
+        album_total = _as_int(tracks_obj["totalCount"])
     elif album.get("totalTracks"):
-        album_total = int(album["totalTracks"])
+        album_total = _as_int(album["totalTracks"])
 
     return {
         "track_id": tid,

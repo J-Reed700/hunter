@@ -28,16 +28,14 @@ from hunter.config import HunterConfig
 
 log = logging.getLogger(__name__)
 
-_CACHE: dict[str, object] = {}
+_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _CACHE_TTL = 300.0
 _LOCK = threading.Lock()
-_INFLIGHT: tuple[threading.Event, dict[str, dict | None]] | None = None
+_INFLIGHT: dict[tuple[str, str], tuple[threading.Event, dict[str, dict | None]]] = {}
 
 # Above this share of the library missing we assume a broken mount, not a
 # deletion. A real accident takes a slice; an unmounted disk takes everything.
 _SUSPECT_FRACTION = 0.25
-# Canary files: if these sampled library paths are all absent the mount is gone.
-_CANARY_N = 40
 _BATCH_SIZE = 2000
 
 _SORTS = {
@@ -49,15 +47,8 @@ _SORTS = {
 }
 
 
-def _text(v) -> str:
-    fn = getattr(libquery, "text", None) or getattr(libquery, "_text", None)
-    if callable(fn):
-        return fn(v)
-    if v is None:
-        return ""
-    if isinstance(v, (bytes, bytearray)):
-        return bytes(v).decode("utf-8", "surrogateescape")
-    return str(v)
+def _cache_key(cfg: HunterConfig) -> tuple[str, str]:
+    return (str(cfg.beets_db), str(cfg.music_root))
 
 
 def _est_bytes(length: float, bitrate: int, fmt: str) -> int:
@@ -102,6 +93,7 @@ def _run_scan(cfg: HunterConfig) -> dict:
     album_totals: dict[int, int] = {}
     total = 0
     alive = 0
+    unmapped = 0
     db_error = ""
     mount_err = ""
 
@@ -125,24 +117,26 @@ def _run_scan(cfg: HunterConfig) -> dict:
                     if aid:
                         album_totals[aid] = album_totals.get(aid, 0) + 1
                     hp = domain.container_to_host_path(cfg, r[1])
-                    if hp is not None:
-                        try:
-                            os.stat(hp)
-                            alive += 1
-                            continue
-                        except FileNotFoundError:
-                            pass
-                        except OSError as exc:
-                            mount_err = f"mount error reading {hp}: {exc}"
-                            break
-                    fmt = _text(r[10])
+                    if hp is None:
+                        unmapped += 1
+                        continue
+                    try:
+                        os.stat(hp)
+                        alive += 1
+                        continue
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        mount_err = f"mount error reading {hp}: {exc}"
+                        break
+                    fmt = libquery.text(r[10])
                     tracks.append({
                         "id": r[0],
                         "album_id": aid,
-                        "artist": _text(r[3]),
-                        "albumartist": _text(r[4]) or _text(r[3]),
-                        "album": _text(r[5]),
-                        "title": _text(r[6]) or "(untitled)",
+                        "artist": libquery.text(r[3]),
+                        "albumartist": libquery.text(r[4]) or libquery.text(r[3]),
+                        "album": libquery.text(r[5]),
+                        "title": libquery.text(r[6]) or "(untitled)",
                         "track": r[7] or 0,
                         "disc": r[8] or 0,
                         "year": r[9] or 0,
@@ -150,9 +144,9 @@ def _run_scan(cfg: HunterConfig) -> dict:
                         "bitrate": r[11] or 0,
                         "length": r[12] or 0.0,
                         "added": r[13] or 0.0,
-                        "mb_albumid": _text(r[14]),
-                        "mb_trackid": _text(r[15]),
-                        "path": _text(r[1]),
+                        "mb_albumid": libquery.text(r[14]),
+                        "mb_trackid": libquery.text(r[15]),
+                        "path": libquery.text(r[1]),
                         "bytes": _est_bytes(r[12] or 0.0, r[11] or 0, fmt),
                     })
                 if mount_err:
@@ -164,16 +158,23 @@ def _run_scan(cfg: HunterConfig) -> dict:
             if conn is not None:
                 conn.close()
 
-    if ok and not db_error and not mount_err and total > 0 and alive == 0:
-        mount_err = (
-            f"none of {total} library files are readable — "
-            "treating this as a mount failure, not a deletion"
-        )
+    mappable = total - unmapped
+    if ok and not db_error and not mount_err and total > 0:
+        if mappable == 0:
+            mount_err = (
+                f"none of {total} library paths map under {cfg.music_root} — "
+                "check HUNTER_MUSIC_ROOT / container path prefix"
+            )
+        elif alive == 0:
+            mount_err = (
+                f"none of {mappable} library files are readable — "
+                "treating this as a mount failure, not a deletion"
+            )
 
     for t in tracks:
         t["album_track_total"] = album_totals.get(t["album_id"], 0) if t["album_id"] else 0
 
-    frac = (len(tracks) / total) if total else 0.0
+    frac = (len(tracks) / mappable) if mappable else 0.0
     suspect = (
         (not ok)
         or bool(db_error)
@@ -197,6 +198,7 @@ def _run_scan(cfg: HunterConfig) -> dict:
     return {
         "scanned_ts": time.time(),
         "items": total,
+        "unmapped": unmapped,
         "missing": 0 if suspect else len(tracks),
         "bytes": 0 if suspect else sum(t["bytes"] for t in tracks),
         "tracks": [] if suspect else tracks,
@@ -208,17 +210,17 @@ def _run_scan(cfg: HunterConfig) -> dict:
 
 def scan(cfg: HunterConfig, *, refresh: bool = False) -> dict:
     """Stat every item in the library without holding _LOCK across the scan."""
-    global _INFLIGHT
+    ck = _cache_key(cfg)
     while True:
         with _LOCK:
-            hit = _CACHE.get("scan")
-            if hit and not refresh and time.time() - hit["scanned_ts"] < _CACHE_TTL:  # type: ignore[index]
-                return hit  # type: ignore[return-value]
-            inflight = _INFLIGHT
+            hit = _CACHE.get(ck)
+            if hit and not refresh and time.monotonic() - hit[0] < _CACHE_TTL:
+                return hit[1]
+            inflight = _INFLIGHT.get(ck)
             if inflight is None:
                 evt = threading.Event()
                 holder: dict[str, dict | None] = {"res": None}
-                _INFLIGHT = (evt, holder)
+                _INFLIGHT[ck] = (evt, holder)
                 break
         evt_wait, holder_wait = inflight
         evt_wait.wait()
@@ -233,10 +235,10 @@ def scan(cfg: HunterConfig, *, refresh: bool = False) -> dict:
         with _LOCK:
             holder["res"] = res
             if res is not None and res.get("trusted"):
-                _CACHE["scan"] = res
+                _CACHE[ck] = (time.monotonic(), res)
             else:
-                _CACHE.pop("scan", None)
-            _INFLIGHT = None
+                _CACHE.pop(ck, None)
+            _INFLIGHT.pop(ck, None)
             evt.set()
     return res
 
@@ -315,11 +317,12 @@ def verify(cfg: HunterConfig, item_ids: list[int]) -> list[dict]:
     or an unhealthy mount."""
     if not item_ids:
         return []
+    ck = _cache_key(cfg)
     ok, why = _storage_ok(cfg)
     if not ok:
         log.warning("recovery verify aborted — mount check failed: %s", why)
         with _LOCK:
-            _CACHE.pop("scan", None)
+            _CACHE.pop(ck, None)
         return []
 
     wanted = sorted({int(i) for i in item_ids})
@@ -355,30 +358,68 @@ def verify(cfg: HunterConfig, item_ids: list[int]) -> list[dict]:
     out: list[dict] = []
     for r in rows:
         hp = domain.container_to_host_path(cfg, r[1])
-        if hp is not None:
-            try:
-                os.stat(hp)
-                continue  # it came back — nothing to recover
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log.warning("recovery verify aborted — stat error on %s: %s", hp, exc)
-                with _LOCK:
-                    _CACHE.pop("scan", None)
-                return []
+        if hp is None:
+            continue
+        try:
+            os.stat(hp)
+            continue  # it came back — nothing to recover
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("recovery verify aborted — stat error on %s: %s", hp, exc)
+            with _LOCK:
+                _CACHE.pop(ck, None)
+            return []
         aid = r[2] or 0
         out.append({
             "id": r[0],
             "album_id": aid,
-            "albumartist": _text(r[3]) or _text(r[4]),
-            "album": _text(r[5]),
-            "title": _text(r[6]),
+            "albumartist": libquery.text(r[3]) or libquery.text(r[4]),
+            "album": libquery.text(r[5]),
+            "title": libquery.text(r[6]),
             "year": r[7] or 0,
             "track": r[8] or 0,
             "album_track_total": album_totals.get(aid, 0) if aid else 0,
             "bytes": 0,
-            "artist": _text(r[4]),
+            "artist": libquery.text(r[4]),
             "format": "",
             "disc": 0,
         })
     return out
+
+
+def requeue_albums(cfg: HunterConfig, state, still_gone: list[dict]) -> tuple[int, int]:
+    """Transactionally queue missing albums for recovery at operator priority.
+
+    Returns ``(added, skipped)``.
+    """
+    added = skipped = 0
+    with state.transaction():
+        for alb in albums_of(still_gone):
+            key = f"recovery:{alb['key']}"
+            track_total = alb.get("album_track_total") or alb.get("tracks") or None
+            try:
+                if state.upsert_want(
+                    key,
+                    alb["artist"],
+                    alb["album"],
+                    alb.get("year") or 0,
+                    track_total,
+                    "recovery",
+                    resurrect=True,
+                    cfg=cfg,
+                ):
+                    state.set_priority(key, domain.PRIORITY_OPERATOR)
+                    state.log_event(
+                        "request",
+                        alb["artist"],
+                        alb["album"],
+                        f"recovery: {alb['tracks']} track(s) missing from disk",
+                    )
+                    added += 1
+                else:
+                    skipped += 1
+            except Exception as exc:                      # noqa: BLE001
+                log.warning("recovery requeue failed for %s — %s", key, exc)
+                skipped += 1
+    return added, skipped

@@ -1,44 +1,36 @@
-import { api, h, mount, fmt, toast, action, busy, setQuery, navigate, link, cover, artUrl, sel, qs, can } from "../app.js";
-import { openMbArtist, requestBtn, ownedOrWant, removeDialog, blockButton } from "./_shared.js";
-import { facetBar, facetParams, groupView, applyGroupPick, selectAllButton, queueDownload } from "./_filters.js";
+import { api, h, mount, fmt, toast, action, busy, navigate, link, cover, artUrl, sel, qs, can } from "../app.js";
+import { openMbArtist, requestBtn, ownedOrWant, removeDialog, blockButton, queueDownload, createTabs } from "./_shared.js";
+import { facetBar, facetParams, groupView, applyGroupPick, selectAllButton } from "./_filters.js";
 
 export default {
   async render(root, r) {
     const defs = [["followed", "Followed"], ["library", "Library artists"], ["calendar", "Release calendar"]];
-    let tab = defs.some(([k]) => k === r.q.tab) ? r.q.tab : "followed";
-    const tabs = h("div", { class: "tabs" });
-    const out = h("div", {});
-    let tabGen = 0;
-    const go = () => {
-      const myGen = ++tabGen;
-      return ({
-        followed: () => followedRoster(out, myGen, () => myGen === tabGen && out.isConnected),
-        library: () => libraryArtists(out, r),
-        calendar: () => calendar(myGen),
-      })[tab]();
-    };
-    const paintTabs = () => mount(tabs, ...defs.map(([k, l]) => h("button", { class: k === tab ? "active" : "", onClick: () => { tab = k; setQuery({ tab }); paintTabs(); go(); } }, l)));
-    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Artists"), h("div", { class: "sub" }, "Followed artists auto-want new releases (Lidarr's roster, replaced). Library artists are sourced from beets — the truth."))), tabs, out);
-    paintTabs();
+    const tabCtl = createTabs(defs, r.q.tab || "followed", (tab, { alive, out }) => ({
+      followed: () => followedRoster(out, 0, alive),
+      library: () => libraryArtists(out, r, alive),
+      calendar: () => calendar(out, alive),
+    })[tab]());
+    mount(root, h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Artists"), h("div", { class: "sub" }, "Followed artists auto-want new releases (Lidarr's roster, replaced). Library artists are sourced from beets — the truth."))), tabCtl.el, tabCtl.out);
 
-    async function calendar(myGen) {
+    async function calendar(out, alive) {
       mount(out, h("div", { class: "skel" }, h("div"), h("div")));
-      const r = await api("/api/calendar");
-      if (myGen !== tabGen || !out.isConnected) return;
+      let res;
+      try { res = await api("/api/calendar"); } catch (e) { if (alive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
+      if (!alive()) return;
       const section = (title, rows) => h("div", { class: "card mb" }, h("h3", {}, title, h("span", { class: "right" }, `${rows.length}`)), rows.length ? h("div", { class: "list" }, ...rows.map(x => h("div", { class: "item" }, cover(artUrl(x.rgid), {}), h("div", { class: "main" }, h("div", { class: "t" }, `${x.artist} — ${x.album}`), h("div", { class: "s" }, x.date, x.rtype ? ` · ${x.rtype}` : "")), h("div", { class: "end" }, ownedOrWant(x), requestBtn(x))))) : h("div", { class: "empty small" }, "nothing"));
-      mount(out, h("div", { class: "hint mb" }, "Releases from followed artists, discovered by the release watch. Subscribe to ", h("a", { href: "/calendar.ics", target: "_blank", rel: "noopener noreferrer" }, "/calendar.ics"), " from any calendar app."), section("Upcoming", r.upcoming), section("Recent (120 days)", r.recent));
+      mount(out, h("div", { class: "hint mb" }, "Releases from followed artists, discovered by the release watch. Subscribe to ", h("a", { href: "/calendar.ics", target: "_blank", rel: "noopener noreferrer" }, "/calendar.ics"), " from any calendar app."), section("Upcoming", res.upcoming), section("Recent (120 days)", res.recent));
     }
-    go();
+    tabCtl.go();
   },
 };
 
 export function openLibArtist(name) { navigate(link("library", {}, "artist", name)); }
 
-export async function libraryArtists(out, r = { q: {} }) {
+export async function libraryArtists(out, r = { q: {} }, alive = () => out.isConnected) {
   // Shared by Artists → Library artists and Library → Artists. Filters live in
   // the URL; multi-select feeds removal / blocklist / download.
   const st = { q: r.q.q || "", filter: r.q.filter || "", genre: r.q.genre || "", decade: r.q.decade || "", added: r.q.added || "", sort: r.q.sort || "name", letter: r.q.letter || "", group: r.q.group || "", min_albums: r.q.min_albums || "", max_albums: r.q.max_albums || "" };
-  let offset = 0, rows = [], total = 0;
+  let offset = 0, rows = [], total = 0, loadGen = 0;
   sel.configure("artists", [
     { label: "Download", onClick: async (items) => { await queueDownload({ title: items.length === 1 ? items[0].name : `${items.length} artists`, artists: items.map(a => a.name) }); sel.clear(); } },
     { label: "Follow", role: "operator", onClick: async (items) => { let n = 0; for (const a of items) { const r = await api("/api/follow_by_name", { name: a.name }).catch(() => ({})); n += r.added ? 1 : 0; } toast(`${n} followed`, "ok"); sel.clear(); load(); } },
@@ -66,12 +58,15 @@ export async function libraryArtists(out, r = { q: {} }) {
     });
   };
   async function load(more = false) {
+    const myGen = ++loadGen;
     bar.paintActive();
     if (st.group) { mount(ctx); await groupView(list, { base: "/api/library/artists", state: st, unit: "artists", onPick: (k) => { if (k !== null) applyGroupPick(st, k); bar.rebuild(); load(); } }); return; }
-    offset = more ? offset + 100 : 0;
-    const r = await api(`/api/library/artists${qs({ ...params(), offset })}`);
-    if (!out.isConnected) return;
-    rows = more ? rows.concat(r.artists) : r.artists; total = r.total;
+    const nextOffset = more ? offset + 100 : 0;
+    let res;
+    try { res = await api(`/api/library/artists${qs({ ...params(), offset: nextOffset })}`); } catch (e) { if (myGen === loadGen && alive()) mount(list, h("div", { class: "notice bad" }, e.message)); return; }
+    if (myGen !== loadGen || !alive()) return;
+    offset = nextOffset;
+    rows = more ? rows.concat(res.artists) : res.artists; total = res.total;
     mount(ctx, h("span", { class: "muted small" }, `${fmt.num(rows.length)} of ${fmt.num(total)} artists`), h("span", { class: "ml-auto" }),
       rows.length ? h("button", { class: "btn xs ghost", onClick: () => { rows.forEach(a => sel.set(a.name, a, true)); withChecksOn(); } }, "Select page") : null,
       selectAllButton({ total, url: `/api/library/artists/names${qs(params())}`, key: "artists", map: (a) => ({ key: a.name, item: a }) }));
@@ -93,14 +88,15 @@ export async function libraryArtists(out, r = { q: {} }) {
       !rows.length ? h("div", { class: "empty" }, "No artists match.") : null);
     withChecks();
   }
-  const withChecksOn = () => list.querySelectorAll(".check").forEach(c => c.classList.add("on"));
+  const withChecksOn = () => list.querySelectorAll(".check:not([data-local])").forEach(c => c.classList.add("on"));
   await load();
 }
 
 export async function followedRoster(out, _gen, isAlive = () => out.isConnected) {
   // Followed-artist management. Shown on Artists → Followed AND Library → Artists → Following.
   mount(out, h("div", { class: "skel" }, h("div"), h("div")));
-  const r = await api("/api/artists");
+  let r;
+  try { r = await api("/api/artists"); } catch (e) { if (isAlive()) mount(out, h("div", { class: "notice bad" }, e.message)); return; }
   if (!isAlive()) return;
   const q = h("input", { class: "input", placeholder: "filter", style: { maxWidth: "280px" } });
   const list = h("div", {});

@@ -43,12 +43,14 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
 
-from hunter import db as hunter_db
+from hunter import config as hunter_config, db as hunter_db
 from hunter.config import HunterConfig
 from hunter.dockerctl import DockerClient, DockerError
+from hunter.domain import tail_file
 
 log = logging.getLogger("hunter.jobs")
 
@@ -86,19 +88,6 @@ def tracked_local_pids() -> set[int]:
         return {int(p.pid) for p in _local_procs.values() if getattr(p, "pid", None)}
 
 
-def ensure_finalizers_registered() -> None:
-    """Guarantee built-in finalizers are registered regardless of import order."""
-    if "library" not in _finalizers:
-        try:
-            mod = sys.modules.get("hunter.libops")
-            if mod is None:
-                import hunter.libops as mod  # noqa: F401
-            if "library" not in _finalizers and hasattr(mod, "_on_library_job"):
-                _finalizers["library"] = mod._on_library_job
-        except Exception:       # noqa: BLE001
-            log.exception("failed to register built-in library finalizer")
-
-
 def _conn(db: Path) -> sqlite3.Connection:
     return hunter_db.open_hunter_db(db, timeout=15.0)
 
@@ -118,20 +107,6 @@ def _row(r: sqlite3.Row | None) -> dict | None:
     d["duration"] = ((d["finished_ts"] or int(time.time())) - d["started_ts"])
     d["command"] = shlex.join(d["argv"]) if d["argv"] else ""
     return d
-
-
-def tail_file(path: str | Path, lines: int = 200,
-              max_bytes: int = 512 * 1024) -> str:
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            data = f.read()
-    except OSError:
-        return ""
-    text = data.decode("utf-8", "replace")
-    return "\n".join(text.splitlines()[-lines:])
 
 
 def parse_progress(text: str) -> dict:
@@ -161,21 +136,22 @@ def parse_progress(text: str) -> dict:
 
 
 class Jobs:
-    def __init__(self, cfg: HunterConfig):
+    def __init__(
+        self,
+        cfg: HunterConfig,
+        *,
+        finalizers: Mapping[str, Callable[["Jobs", dict], None]] | None = None,
+    ):
         self.cfg = cfg
         self.db = cfg.state_db
         self.docker = DockerClient(cfg.docker_sock)
         self.local_log_dir = cfg.log_dir / "jobs"
         # hunter-side view of the beets job log dir
         self.beets_log_dir = cfg.beets_automation_dir / "logs" / "jobs"
+        self._finalizers: dict[str, Callable[["Jobs", dict], None]] = dict(finalizers or {})
 
     def _beets_job_dirs(self) -> tuple[str, str]:
-        raw = getattr(self.cfg, "beets_automation_container_dir", None)
-        base = (
-            raw.strip().rstrip("/")
-            if isinstance(raw, str) and raw.strip()
-            else "/config/automation"
-        )
+        base = hunter_config.beets_automation_dir_str(self.cfg)
         if base == "/config/automation":
             return BEETS_JOB_LOG_DIR, BEETS_JOB_PID_DIR
         return f"{base}/logs/jobs", f"{base}/state/jobs"
@@ -243,12 +219,6 @@ class Jobs:
     def running_count(self, *, refresh: bool = True) -> int:
         return len(self.running(refresh=refresh))
 
-    def find_running(self, predicate, *, refresh: bool = True) -> dict | None:
-        for j in self.running(refresh=refresh):
-            if predicate(j):
-                return j
-        return None
-
     def tail(self, job_id: str, lines: int = 200, *, refresh: bool = True) -> dict | None:
         job = self.get(job_id, refresh=refresh)
         if not job:
@@ -265,11 +235,18 @@ class Jobs:
         now = int(time.time())
         c = _conn(self.db)
         try:
-            c.execute(
-                "UPDATE jobs SET status='failed', finished_ts=?"
-                " WHERE status='starting' AND started_ts < ?",
-                (now, now - 120),
-            )
+            stale_starting = c.execute(
+                "SELECT id FROM jobs WHERE status='starting' AND started_ts < ?",
+                (now - 120,),
+            ).fetchall()
+            for sr in stale_starting:
+                cur = c.execute(
+                    "UPDATE jobs SET status='failed', finished_ts=?"
+                    " WHERE id=? AND status='starting'",
+                    (now, sr["id"]),
+                )
+                if cur.rowcount == 1:
+                    settled.append(sr["id"])
             c.commit()
             rows = c.execute(
                 "SELECT * FROM jobs WHERE status='running'").fetchall()
@@ -277,6 +254,25 @@ class Jobs:
                 done, code, status = self._probe(r)
                 if done and self._settle(c, r["id"], status, code):
                     settled.append(r["id"])
+            # Also pick up any previously settled job whose finalizer wasn't registered yet.
+            known_kinds = set(self._finalizers) | set(_finalizers)
+            if known_kinds:
+                qmarks = ",".join("?" * len(known_kinds))
+                pending = c.execute(
+                    f"SELECT id, meta FROM jobs"
+                    f" WHERE status NOT IN ('starting', 'running')"
+                    f"   AND kind IN ({qmarks})",
+                    tuple(sorted(known_kinds)),
+                ).fetchall()
+                for pr in pending:
+                    if pr["id"] in settled:
+                        continue
+                    try:
+                        pmeta = json.loads(pr["meta"] or "{}")
+                    except ValueError:
+                        pmeta = {}
+                    if "finalized_ts" not in pmeta:
+                        settled.append(pr["id"])
         finally:
             c.close()
         for job_id in settled:
@@ -297,18 +293,46 @@ class Jobs:
         return cur.rowcount == 1
 
     def _finalize(self, job: dict) -> None:
-        ensure_finalizers_registered()
-        fn = _finalizers.get(job["kind"])
-        if fn is not None:
+        fn = self._finalizers.get(job["kind"]) or _finalizers.get(job["kind"])
+        meta = dict(job.get("meta") or {})
+        if "finalized_ts" in meta:
+            return
+        if fn is None:
+            if meta.get("side") is not None or (job["kind"] == "library" and meta.get("op")):
+                log.error(
+                    "job %s (%s) carries side-effect metadata but no finalizer is registered",
+                    job["id"],
+                    job["kind"],
+                )
+                return
+        else:
+            # Claim finalization atomically before running fn so concurrent refresh() calls
+            # cannot execute the same finalizer twice.
+            claimed = dict(meta)
+            claimed["finalized_ts"] = int(time.time())
+            c = _conn(self.db)
+            try:
+                cur = c.execute(
+                    "UPDATE jobs SET meta=? WHERE id=? AND meta NOT LIKE '%\"finalized_ts\"%'",
+                    (json.dumps(claimed), job["id"]),
+                )
+                c.commit()
+                if cur.rowcount != 1:
+                    return
+            finally:
+                c.close()
             try:
                 fn(self, job)
             except Exception:                        # noqa: BLE001
                 log.exception("finalizer for job %s (%s) failed", job["id"], job["kind"])
-        meta = dict(job.get("meta") or {})
+            return
         meta["finalized_ts"] = int(time.time())
         c = _conn(self.db)
         try:
-            c.execute("UPDATE jobs SET meta=? WHERE id=?", (json.dumps(meta), job["id"]))
+            c.execute(
+                "UPDATE jobs SET meta=? WHERE id=? AND meta NOT LIKE '%\"finalized_ts\"%'",
+                (json.dumps(meta), job["id"]),
+            )
             c.commit()
         finally:
             c.close()
@@ -395,18 +419,8 @@ class Jobs:
         finally:
             c.close()
 
-    def _new_id(self, kind: str) -> str:
+    def new_id(self, kind: str) -> str:
         return f"{time.strftime('%Y%m%d_%H%M%S')}_{kind}_{uuid.uuid4().hex[:6]}"
-
-    def _guard(self, runner: str, kind: str, exclusive_key: str | None) -> str | None:
-        running = self.running()
-        if sum(1 for j in running if j["runner"] == runner) >= _MAX_CONCURRENT[runner]:
-            return f"{_MAX_CONCURRENT[runner]} {runner} jobs already running — wait for one to finish"
-        if exclusive_key:
-            for j in running:
-                if j["meta"].get("exclusive") == exclusive_key:
-                    return f"already running: {j['title']} ({j['id']})"
-        return None
 
     def _guard_and_reserve(self, rec: dict, runner: str, exclusive_key: str | None) -> str | None:
         """Atomically check active job limits + exclusive key under BEGIN IMMEDIATE
@@ -498,7 +512,7 @@ class Jobs:
 
         # Reconcile stale rows BEFORE acquiring _START_LOCK / BEGIN IMMEDIATE.
         self.refresh()
-        jid = job_id or self._new_id(kind)
+        jid = job_id or self.new_id(kind)
         rec = {"id": jid, "kind": kind, "title": title, "argv": argv,
                "mode": mode, "runner": "beets", "exec_id": None,
                "log": str(self.beets_log_dir / f"{jid}.log"),
@@ -522,12 +536,12 @@ class Jobs:
             f"echo $child > {shlex.quote(c_pid)}; "
             f"wait $child; rc=$?; "
             f"echo \"# finished $(date '+%F %T')\"; echo \"exit=$rc\"; "
-            f"rm -f {shlex.quote(c_pid)}"
+            f"rm -f {shlex.quote(c_pid)}; exit $rc"
         )
         try:
             res = self.docker.exec_run(
                 self.cfg.beets_container, ["sh", "-c", script],
-                user=getattr(self.cfg, "beets_exec_user", ""), detach=True, timeout=30,
+                user=hunter_config.beets_exec_user_str(self.cfg), detach=True, timeout=30,
                 env=env or None)
             job = self._activate_reservation(jid, exec_id=res["exec_id"])
         except DockerError as exc:
@@ -545,12 +559,14 @@ class Jobs:
                     mode: str = "run", meta: dict | None = None,
                     exclusive: str | None = None,
                     origin: str = "ui") -> dict:
+        if not argv:
+            return {"ok": False, "error": "empty argv"}
         meta = dict(meta or {})
         if exclusive:
             meta["exclusive"] = exclusive
 
         self.refresh()
-        job_id = self._new_id(kind)
+        job_id = self.new_id(kind)
         self.local_log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.local_log_dir / f"{job_id}.log"
         rec = {"id": job_id, "kind": kind, "title": title, "argv": argv,
@@ -587,6 +603,24 @@ class Jobs:
             self._release_reservation(job_id)
             return {"ok": False, "error": f"spawn failed: {exc}"}
         except BaseException:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
             with _lock:
                 _local_procs.pop(job_id, None)
             self._release_reservation(job_id)
@@ -597,12 +631,30 @@ class Jobs:
             try:
                 fh.write((f"# finished {time.strftime('%F %T')}\n"
                           f"exit={rc}\n").encode())
-                fh.close()
+                fh.flush()
             except OSError:
                 pass
+            finally:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            settled = False
+            c = _conn(self.db)
+            try:
+                settled = self._settle(c, job_id, self._status_for(rc), rc)
+            except Exception:
+                log.exception("failed settling local job %s", job_id)
+            finally:
+                c.close()
             with _lock:
                 _local_procs.pop(job_id, None)
-            self.refresh()
+            if settled:
+                done_job = self._fetch(job_id)
+                if done_job:
+                    self._finalize(done_job)
+            else:
+                self.refresh()
         threading.Thread(target=reap, daemon=True, name=f"job-{job_id}").start()
         log.info("job started [%s] %s: %s", job_id, title, shlex.join(argv))
         return {"ok": True, "job": job}
@@ -644,7 +696,7 @@ class Jobs:
         script = (
             f"p=$(cat {shlex.quote(pidfile)} 2>/dev/null); "
             f"if [ -n \"$p\" ]; then "
-            f"  (kill -{sig} -- -$p 2>/dev/null || kill -{sig} $p 2>/dev/null) "
+            f"  (kill -{sig} -$p 2>/dev/null || kill -{sig} -- -$p 2>/dev/null || kill -{sig} $p 2>/dev/null) "
             f"  && {{ echo \"killed $p\"; "
             f"       printf '# cancel requested (SIG{sig}) %s\\n' \"$(date '+%F %T')\" >> {shlex.quote(c_log)} 2>/dev/null || true; }} "
             f"  || {{ echo \"kill-failed $p\"; exit 1; }}; "
@@ -653,7 +705,7 @@ class Jobs:
         try:
             res = self.docker.exec_run(self.cfg.beets_container,
                                        ["sh", "-c", script],
-                                       user=getattr(self.cfg, "beets_exec_user", ""),
+                                       user=hunter_config.beets_exec_user_str(self.cfg),
                                        timeout=20)
         except DockerError as exc:
             return {"ok": False, "error": str(exc)}
@@ -670,12 +722,18 @@ class Jobs:
         n = 0
         cutoff = time.time() - _LOG_KEEP_DAYS * 86_400
         try:
-            for p in self.local_log_dir.iterdir():
-                if p.suffix == ".log" and p.stat().st_mtime < cutoff:
+            entries = list(self.local_log_dir.iterdir())
+        except OSError:
+            return 0
+        for p in entries:
+            if p.suffix != ".log":
+                continue
+            try:
+                if p.stat().st_mtime < cutoff:
                     p.unlink()
                     n += 1
-        except OSError:
-            pass
+            except OSError:
+                continue
         return n
 
 

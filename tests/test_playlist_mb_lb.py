@@ -188,8 +188,7 @@ class TestMusicBrainz(unittest.TestCase):
     def setUp(self) -> None:
         with mb._cache_lock:
             mb._cache.clear()
-        with mb._rate_lock:
-            mb._next_slot = 0.0
+        mb._client.limiter.reset()
 
     def test_user_agent_dynamic_contact_and_thread_local_session(self) -> None:
         clear_config_cache()
@@ -277,8 +276,8 @@ class TestMusicBrainz(unittest.TestCase):
             mb._session(),
             "get",
             return_value=_resp(503, headers={"Retry-After": "999"}),
-        ), patch("hunter.mb.time.sleep", side_effect=fake_sleep), \
-             patch("hunter.mb.time.monotonic", side_effect=lambda: clock["now"]):
+        ), patch("hunter.http_client.time.sleep", side_effect=fake_sleep), \
+             patch("hunter.http_client.time.monotonic", side_effect=lambda: clock["now"]):
             with self.assertRaises(mb.MBUnavailable):
                 mb.mb_get("/artist", {"query": "test_no_sleep"})
         # 4 attempts -> retry sleeps only on attempts 0, 1, 2 (each capped at 30s)
@@ -290,7 +289,7 @@ class TestMusicBrainz(unittest.TestCase):
         observed_locked: list[bool] = []
 
         def fake_get(url, **kw):
-            observed_locked.append(mb._rate_lock.locked())
+            observed_locked.append(mb._client.limiter._lock.locked())
             return _resp(200, {"artists": []})
 
         with patch.object(mb._session(), "get", side_effect=fake_get):
@@ -300,8 +299,7 @@ class TestMusicBrainz(unittest.TestCase):
 
 class TestListenBrainz(unittest.TestCase):
     def setUp(self) -> None:
-        with lb._rate_lock:
-            lb._next_slot = 0.0
+        lb._client.limiter.reset()
 
     def test_invalid_json_shapes_and_partial_batch_do_not_poison_canon(self) -> None:
         rgs = [{"rgid": f"rg-{i}", "album": f"Alb {i}", "year": 2020} for i in range(60)]
@@ -317,14 +315,14 @@ class TestListenBrainz(unittest.TestCase):
         batch2_resp = _resp(500, text="server error")
 
         with patch.object(lb._session(), "post", side_effect=[batch1_resp, batch2_resp]), \
-             patch("hunter.listenbrainz.time.sleep"):
-            scored, complete = lb.canon_scores_checked("mbid-1", rgs)
+             patch("hunter.http_client.time.sleep"):
+            scored, complete = lb.canon_scores_checked(rgs)
         self.assertFalse(complete)
         self.assertEqual(len(scored), 1)
 
         with patch.object(lb._session(), "post", side_effect=[batch1_resp, batch2_resp]), \
-             patch("hunter.listenbrainz.time.sleep"):
-            self.assertEqual(lb.canon_scores("mbid-1", rgs), [])
+             patch("hunter.http_client.time.sleep"):
+            self.assertEqual(lb.canon_scores(rgs), [])
 
     def test_empty_mbids_filtered_and_complete_batch_succeeds(self) -> None:
         rgs = [
@@ -340,8 +338,8 @@ class TestListenBrainz(unittest.TestCase):
             ],
         )
         with patch.object(lb._session(), "post", return_value=ok_resp) as mock_post, \
-             patch("hunter.listenbrainz.time.sleep"):
-            out = lb.canon_scores("mbid-1", rgs)
+             patch("hunter.http_client.time.sleep"):
+            out = lb.canon_scores(rgs)
         self.assertEqual(len(out), 2)
         self.assertEqual(out[0]["score"], 1.0)
         sent = mock_post.call_args.kwargs["json"]["release_group_mbids"]

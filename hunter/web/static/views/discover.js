@@ -9,7 +9,7 @@ export default {
     let kind = allowedKinds.includes(r.q.kind) ? r.q.kind : "album";
     let tab = allowedTabs.includes(r.q.tab) ? r.q.tab : "mb";
     let q = r.q.q || "";
-    let results = [], offset = 0, timer = null, retryTimer = null, searchGen = 0, sort = "rel", filt = "all";
+    let results = [], offset = 0, lastHasMore = false, timer = null, retryTimer = null, searchGen = 0, sort = "rel", filt = "all";
     onCleanup(() => { clearTimeout(timer); clearTimeout(retryTimer); });
     const input = h("input", { class: "input", placeholder: "Album, artist, song — or paste a MusicBrainz / Spotify URL", value: q, type: "search", enterkeyhint: "search", autocomplete: "off", autofocus: matchMedia("(pointer: fine)").matches });
     const segK = h("div", { class: "seg" });
@@ -40,12 +40,15 @@ export default {
       if (tab === "soulseek") return paintSoulseek(myGen);
       if (!q || q.length < 2) { mount(out, h("div", { class: "empty" }, h("div", { class: "big" }, "⌕"), "Type at least two characters. ", h("kbd", {}, "⌘K"), " opens this from anywhere.")); return; }
       if (/^https?:\/\//i.test(q)) return resolveUrl(q, myGen);
-      if (!more) { offset = 0; skel(); } else offset += 20;
+      const nextOffset = more ? offset + 20 : 0;
+      if (!more) skel();
       try {
-        const r = await api(`/api/search${qs({ kind, q, offset })}`);
+        const r = await api(`/api/search${qs({ kind, q, offset: nextOffset })}`);
         if (myGen !== searchGen || !out.isConnected) return;
+        offset = nextOffset;
         results = more ? results.concat(r.results) : r.results;
-        paintResults(r.results.length >= 20);
+        lastHasMore = r.results.length >= 20;
+        paintResults(lastHasMore);
       } catch (e) {
         if (myGen !== searchGen || !out.isConnected) return;
         if (e.status === 503) {
@@ -57,10 +60,10 @@ export default {
     function paintTools() {
       if (kind === "artist") { mount(tools); return; }
       mount(tools,
-        h("select", { class: "select sm", onChange: (e) => { sort = e.target.value; paintResults(); } }, ...[["rel", "Relevance"], ["year", "Newest"], ["year_asc", "Oldest"], ["artist", "Artist"]].map(([v, l]) => h("option", { value: v, selected: sort === v }, l))),
-        h("select", { class: "select sm", onChange: (e) => { filt = e.target.value; paintResults(); } }, ...[["all", "All"], ["missing", "Not owned"], ["partial", "Partial"], ["owned", "Owned"]].map(([v, l]) => h("option", { value: v, selected: filt === v }, l))));
+        h("select", { class: "select sm", onChange: (e) => { sort = e.target.value; paintResults(lastHasMore); } }, ...[["rel", "Relevance"], ["year", "Newest"], ["year_asc", "Oldest"], ["artist", "Artist"]].map(([v, l]) => h("option", { value: v, selected: sort === v }, l))),
+        h("select", { class: "select sm", onChange: (e) => { filt = e.target.value; paintResults(lastHasMore); } }, ...[["all", "All"], ["missing", "Not owned"], ["partial", "Partial"], ["owned", "Owned"]].map(([v, l]) => h("option", { value: v, selected: filt === v }, l))));
     }
-    function paintResults(hasMore = false) {
+    function paintResults(hasMore = lastHasMore) {
       paintTools();
       let rows = results.slice();
       if (kind !== "artist") {
@@ -88,7 +91,7 @@ export default {
       try {
         const r = await api("/api/resolve_url", { url });
         if (myGen !== searchGen || !out.isConnected) return;
-        if (r.kind === "album") { results = [r.album]; kind = "album"; paintSegs(); paintResults(); }
+        if (r.kind === "album") { results = [r.album]; lastHasMore = false; kind = "album"; paintSegs(); paintResults(false); }
         else if (r.kind === "artist") { openMbArtist(r.artist.id, r.artist.name); mount(out, h("div", { class: "empty" }, "Opened ", h("b", {}, r.artist.name))); }
         else mount(out, h("div", { class: "notice info" }, h("div", { class: "body" }, r.detail)));
       } catch (e) { if (myGen === searchGen && out.isConnected) mount(out, h("div", { class: "notice bad" }, e.message)); }

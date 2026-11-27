@@ -125,12 +125,18 @@ def resolve(cfg: HunterConfig, *, item_ids: list[int] = (), album_ids: list[int]
             chunks += conn.execute(sql % f"i.id IN ({','.join('?' * len(part))})", part).fetchall()
         aids = [int(x) for x in album_ids][:5000]
         for part in domain.chunked(aids, 400):
+            if len(chunks) > max_files + 1:
+                break
             chunks += conn.execute(sql % f"i.album_id IN ({','.join('?' * len(part))})", part).fetchall()
         artist_list = [a for a in dict.fromkeys(artists) if a][:500]
         for part in domain.chunked(artist_list, 400):
+            if len(chunks) > max_files + 1:
+                break
             chunks += conn.execute(sql % f"i.albumartist IN ({','.join('?' * len(part))})", part).fetchall()
         arts: dict[int, tuple[str, str]] = {}
         for r in chunks:
+            if len(files) > max_files:
+                break
             if r["id"] in files:
                 continue
             hp = domain.container_to_host_path(cfg, r["path"])
@@ -192,8 +198,35 @@ def get(cfg: HunterConfig, bid: str) -> dict | None:
     return None
 
 
+def _unlink_artifacts(cfg: HunterConfig, bid: str, suffixes: tuple[str, ...] = (".zip", ".zip.part", ".files.json")) -> None:
+    base = _dir(cfg)
+    for suffix in suffixes:
+        try:
+            os.remove(base / f"{bid}{suffix}")
+        except OSError:
+            pass
+
+
+def bundle_file_info(cfg: HunterConfig, bundle: dict) -> tuple[Path, str] | None:
+    """Return ``(confined_zip_path, safe_download_filename)`` for a ready bundle."""
+    bid = bundle.get("id")
+    if not bid or bundle.get("status") != "ready":
+        return None
+    dl_dir = _dir(cfg)
+    raw = bundle.get("path")
+    cand = Path(raw) if isinstance(raw, str) and raw else (dl_dir / f"{bid}.zip")
+    p = domain.resolve_under(dl_dir, cand)
+    if p is None or not p.is_file():
+        return None
+    fname = f"{_safe(bundle.get('title') or bid)}.zip"
+    return p, fname
+
+
 def create(cfg: HunterConfig, *, title: str, requested_by: str, item_ids=(), album_ids=(),
            artists=(), role: str = "") -> dict:
+    # Reclaim expired bundles BEFORE enforcing disk headroom and viewer quotas
+    # so restarts with only expired bundles never lock out new downloads.
+    sweep(cfg)
     max_bundle_bytes, _keep_bytes, ttl_s, max_files = _limits(cfg)
     sel = resolve(cfg, item_ids=item_ids, album_ids=album_ids, artists=artists)
     if not sel["count"]:
@@ -249,9 +282,10 @@ def create(cfg: HunterConfig, *, title: str, requested_by: str, item_ids=(), alb
             if viewer_total > VIEWER_MAX_TOTAL_BYTES:
                 return {"ok": False,
                         "error": "viewer total bundle disk quota exceeded (20 GB max)"}
+        # Write manifest BEFORE saving registry row so a disk-full failure leaves no orphan row.
+        _write_manifest(cfg, bid, sel["files"])
         items.append(b)
         _save(cfg, items)
-        _write_manifest(cfg, bid, sel["files"])
         _ensure_worker(cfg)
         _wake.set()
     return {"ok": True, "bundle": b}
@@ -310,17 +344,22 @@ def recover_on_startup(cfg: HunterConfig) -> dict:
 
 
 def cancel(cfg: HunterConfig, bid: str) -> dict:
+    unlink_manifest = False
     with _lock:
         items = _load(cfg)
         b = next((x for x in items if x["id"] == bid), None)
         if not b:
             return {"ok": False, "error": "unknown bundle"}
-        if b["status"] in ("queued", "building"):
+        if b["status"] == "building":
             _cancel.add(bid)
-            if b["status"] == "queued":
-                b["status"] = "cancelled"
-                _save(cfg, items)
-        return {"ok": True, "status": b["status"]}
+        elif b["status"] == "queued":
+            b["status"] = "cancelled"
+            _save(cfg, items)
+            unlink_manifest = True
+        status = b["status"]
+    if unlink_manifest:
+        _unlink_artifacts(cfg, bid, (".files.json",))
+    return {"ok": True, "status": status}
 
 
 def delete(cfg: HunterConfig, bid: str) -> dict:
@@ -333,11 +372,7 @@ def delete(cfg: HunterConfig, bid: str) -> dict:
             _cancel.add(bid)
         items = [x for x in items if x["id"] != bid]
         _save(cfg, items)
-    for suffix in (".zip", ".zip.part", ".files.json"):
-        try:
-            os.remove(_dir(cfg) / f"{bid}{suffix}")
-        except OSError:
-            pass
+    _unlink_artifacts(cfg, bid)
     return {"ok": True}
 
 
@@ -360,10 +395,12 @@ def sweep(cfg: HunterConfig) -> dict:
         items = _load(cfg)
         keep = []
         for b in items:
-            if b.get("status") == "ready" and now > b.get("expires_ts", 0):
+            exp = b.get("expires_ts") or 0
+            if b.get("status") == "ready" and exp > 0 and now > exp:
                 removed += 1
                 continue
-            if b.get("status") in ("failed", "cancelled") and now - b.get("created_ts", 0) > 3600:
+            created = b.get("created_ts") or 0
+            if b.get("status") in ("failed", "cancelled") and created > 0 and now - created > 3600:
                 removed += 1
                 continue
             keep.append(b)
@@ -377,11 +414,7 @@ def sweep(cfg: HunterConfig) -> dict:
         gone = {b["id"] for b in items} - {b["id"] for b in keep}
         _save(cfg, keep)
     for bid in gone:
-        for suffix in (".zip", ".zip.part", ".files.json"):
-            try:
-                os.remove(_dir(cfg) / f"{bid}{suffix}")
-            except OSError:
-                pass
+        _unlink_artifacts(cfg, bid)
     return {"removed": removed}
 
 
@@ -430,50 +463,57 @@ def _update(cfg: HunterConfig, bid: str, **fields) -> None:
         _save(cfg, items)
 
 
+def _is_cancelled(bid: str) -> bool:
+    with _lock:
+        return bid in _cancel
+
+
 def _build(cfg: HunterConfig, bid: str) -> None:
     _max_b, _keep_b, ttl_s, _max_f = _limits(cfg)
-    try:
-        with open(_dir(cfg) / f"{bid}.files.json", encoding="utf-8") as f:
-            files = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        _update(cfg, bid, status="failed", error=f"manifest: {exc}")
-        return
     final = _dir(cfg) / f"{bid}.zip"
     part = _dir(cfg) / f"{bid}.zip.part"
     done_b = done_n = skipped_n = 0
     last = 0.0
     used_arcs: set[str] = set()
     try:
+        try:
+            with open(_dir(cfg) / f"{bid}.files.json", encoding="utf-8") as f:
+                files = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            _update(cfg, bid, status="failed", error=f"manifest: {exc}")
+            return
         with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as z:
             for fe in files:
-                if bid in _cancel:
+                if _is_cancelled(bid):
                     raise _Cancelled()
                 src = fe["src"]
                 try:
                     st = os.stat(src)
+                    fin = open(src, "rb")
                 except OSError:
                     skipped_n += 1
                     continue
-                dt = time.localtime(st.st_mtime)[:6]
-                if dt[0] < 1980:
-                    dt = (1980, 1, 1, 0, 0, 0)
-                arc = _unique_arc(fe["arc"], used_arcs)
-                info = zipfile.ZipInfo(arc, date_time=dt)
-                info.compress_type = zipfile.ZIP_STORED
-                info.file_size = st.st_size
-                with open(src, "rb") as fin, z.open(info, "w", force_zip64=True) as out:
-                    while True:
-                        if bid in _cancel:
-                            raise _Cancelled()
-                        buf = fin.read(1 << 20)
-                        if not buf:
-                            break
-                        out.write(buf)
-                        done_b += len(buf)
-                        if time.time() - last > 1.0:
-                            _update(cfg, bid, bytes_done=done_b, files_done=done_n,
-                                    files_skipped=skipped_n)
-                            last = time.time()
+                with fin:
+                    dt = time.localtime(st.st_mtime)[:6]
+                    if dt[0] < 1980:
+                        dt = (1980, 1, 1, 0, 0, 0)
+                    arc = _unique_arc(fe["arc"], used_arcs)
+                    info = zipfile.ZipInfo(arc, date_time=dt)
+                    info.compress_type = zipfile.ZIP_STORED
+                    info.file_size = st.st_size
+                    with z.open(info, "w", force_zip64=True) as out:
+                        while True:
+                            if _is_cancelled(bid):
+                                raise _Cancelled()
+                            buf = fin.read(1 << 20)
+                            if not buf:
+                                break
+                            out.write(buf)
+                            done_b += len(buf)
+                            if time.time() - last > 1.0:
+                                _update(cfg, bid, bytes_done=done_b, files_done=done_n,
+                                        files_skipped=skipped_n)
+                                last = time.time()
                 done_n += 1
         with _lock:
             items = _load(cfg)
@@ -498,15 +538,9 @@ def _build(cfg: HunterConfig, bid: str) -> None:
         _update(cfg, bid, status="failed", error=f"{type(exc).__name__}: {exc}",
                 bytes_done=done_b, files_done=done_n, files_skipped=skipped_n)
     finally:
-        _cancel.discard(bid)
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        try:
-            os.remove(_dir(cfg) / f"{bid}.files.json")
-        except OSError:
-            pass
+        with _lock:
+            _cancel.discard(bid)
+        _unlink_artifacts(cfg, bid, (".zip.part", ".files.json"))
 
 
 class _Cancelled(Exception):

@@ -38,10 +38,15 @@ LOCKOUT_SECONDS = 300
 FAIL_DELAY = 0.3
 _MAX_THROTTLE_ENTRIES = 10_000
 
-_REDACT = (
-    "password", "passwd", "new", "current", "secret", "client_secret",
-    "sp_dc", "token", "api_key", "cookie", "url", "code", "refresh_token",
+_REDACT_EXACT = frozenset({"new", "current", "code", "auth_code", "url", "sp_dc"})
+_REDACT_SUBSTR = (
+    "password", "passwd", "secret", "token", "api_key", "cookie", "authorization",
 )
+
+
+def _should_redact(key: str) -> bool:
+    lk = key.lower()
+    return lk in _REDACT_EXACT or any(s in lk for s in _REDACT_SUBSTR)
 
 _AUDIT_KEEP = 20_000
 
@@ -167,23 +172,25 @@ def _throttle_key(ip: str, subject: str) -> str:
 def _evict_if_full(now: float) -> None:
     if len(_fails) < _MAX_THROTTLE_ENTRIES:
         return
+    # Reclaim headroom in batches (10%) to avoid O(N) thrashing on every request.
+    target_size = max(1, int(_MAX_THROTTLE_ENTRIES * 0.9))
     expired = [k for k, (n, until) in _fails.items() if n >= LOCKOUT_AFTER and until <= now]
     for k in expired:
         _fails.pop(k, None)
-    if len(_fails) < _MAX_THROTTLE_ENTRIES:
+    if len(_fails) <= target_size:
         return
     non_locked = [k for k, (n, until) in _fails.items() if n < LOCKOUT_AFTER or until <= now]
     for k in non_locked:
         _fails.pop(k, None)
-        if len(_fails) < _MAX_THROTTLE_ENTRIES:
+        if len(_fails) <= target_size:
             return
-    while len(_fails) >= _MAX_THROTTLE_ENTRIES:
+    while len(_fails) > target_size:
         _fails.popitem(last=False)
 
 
 def locked_for(ip: str, username: str) -> int:
     key = _throttle_key(ip, username)
-    now = time.time()
+    now = time.monotonic()
     with _fails_lock:
         rec = _fails.get(key)
         if not rec:
@@ -199,7 +206,7 @@ def locked_for(ip: str, username: str) -> int:
 
 def _note_failure(ip: str, username: str) -> None:
     key = _throttle_key(ip, username)
-    now = time.time()
+    now = time.monotonic()
     with _fails_lock:
         rec = _fails.get(key)
         if rec is None:
@@ -313,7 +320,8 @@ class Auth:
         rows = self._conn.execute(
             "SELECT u.*, (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id"
             " AND s.expires_ts > ?) AS sessions FROM users u"
-            " ORDER BY role DESC, username COLLATE NOCASE",
+            " ORDER BY CASE u.role WHEN 'admin' THEN 0 WHEN 'operator' THEN 1"
+            " ELSE 2 END, u.username COLLATE NOCASE",
             (int(time.time()),),
         ).fetchall()
         out = []
@@ -491,18 +499,23 @@ class Auth:
         check_password_policy(new)
         if not self.user(user_id):
             raise AuthError("unknown user", 404)
-        self._conn.execute(
-            "UPDATE users SET pw=?, must_change_pw=?, updated_ts=? WHERE id=?",
-            (hash_password(new), int(must_change), int(time.time()), user_id),
-        )
-        if keep_session:
+        try:
             self._conn.execute(
-                "DELETE FROM sessions WHERE user_id=? AND id!=?",
-                (user_id, keep_session),
+                "UPDATE users SET pw=?, must_change_pw=?, updated_ts=? WHERE id=?",
+                (hash_password(new), int(must_change), int(time.time()), user_id),
             )
-        else:
-            self._conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
-        self._conn.commit()
+            if keep_session:
+                self._conn.execute(
+                    "DELETE FROM sessions WHERE user_id=? AND id!=?",
+                    (user_id, keep_session),
+                )
+            else:
+                self._conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def change_own_password(
         self,
@@ -561,16 +574,21 @@ class Auth:
         now = int(time.time())
         ttl = SESSION_TTL_REMEMBER if remember else SESSION_TTL
         sid = _tok_hash(token)
-        self._conn.execute(
-            "INSERT INTO sessions (id, user_id, created_ts, last_seen_ts, expires_ts,"
-            " remember, ua, ip) VALUES (?,?,?,?,?,?,?,?)",
-            (sid, r["id"], now, now, now + ttl, int(remember), ua[:200], ip[:64]),
-        )
-        self._conn.execute(
-            "UPDATE users SET last_login_ts=? WHERE id=?", (now, r["id"])
-        )
-        self._conn.execute("DELETE FROM sessions WHERE expires_ts < ?", (now,))
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                "INSERT INTO sessions (id, user_id, created_ts, last_seen_ts, expires_ts,"
+                " remember, ua, ip) VALUES (?,?,?,?,?,?,?,?)",
+                (sid, r["id"], now, now, now + ttl, int(remember), ua[:200], ip[:64]),
+            )
+            self._conn.execute(
+                "UPDATE users SET last_login_ts=? WHERE id=?", (now, r["id"])
+            )
+            self._conn.execute("DELETE FROM sessions WHERE expires_ts <= ?", (now,))
+            self._conn.commit()
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
         p = Principal(
             r["id"],
             r["username"],
@@ -581,8 +599,6 @@ class Auth:
             bool(r["must_change_pw"]),
         )
         return p, token, (ttl if remember else None)
-
-    login = authenticate
 
     def principal_for_token(
         self, token: str, *, ip: str = ""
@@ -596,7 +612,7 @@ class Auth:
             " FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?",
             (sid,),
         ).fetchone()
-        if not r or r["expires_ts"] < now or r["disabled"]:
+        if not r or r["expires_ts"] <= now or r["disabled"]:
             return None
         if now - r["last_seen_ts"] > SESSION_TOUCH_EVERY:
             ttl = SESSION_TTL_REMEMBER if r["remember"] else SESSION_TTL
@@ -751,8 +767,8 @@ def _redact_value(val: Any, depth: int = 0) -> Any:
     if isinstance(val, dict):
         out: dict[str, Any] = {}
         for k, v in val.items():
-            lk = str(k).lower()
-            out[str(k)] = "•••" if any(s in lk for s in _REDACT) else _redact_value(v, depth + 1)
+            ks = str(k)
+            out[ks] = "•••" if _should_redact(ks) else _redact_value(v, depth + 1)
         return out
     if isinstance(val, list):
         return [_redact_value(item, depth + 1) for item in val[:25]]
@@ -764,8 +780,7 @@ def summarize_body(body: dict, limit: int = 600) -> str:
         return ""
     clean: dict[str, Any] = {}
     for k, v in body.items():
-        lk = str(k).lower()
-        if any(s in lk for s in _REDACT):
+        if _should_redact(str(k)):
             clean[k] = "•••"
         elif isinstance(v, (list, dict)):
             redacted = _redact_value(v)

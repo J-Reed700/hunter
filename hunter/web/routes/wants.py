@@ -5,20 +5,14 @@ import re
 
 import requests
 
-from hunter import domain, mb
+from hunter import blocklist, domain, mb
 from hunter.domain import norm_album, norm_artist
 from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
 
 log = common.log
-
-
-def _rgid_from_key(key: str) -> str | None:
-    for prefix in ("request:rg:", "release:rg:"):
-        if key.startswith(prefix):
-            return key[len(prefix):]
-    return None
+_MAX_ENQUEUE_FILES = 500
 
 
 @get("/api/wants")
@@ -54,19 +48,14 @@ def want(ctx: Ctx):
     lib = common.library(ctx.cfg)
     owned = None
     if lib is not None:
-        res = None
-        rgid = _rgid_from_key(row["spotify_album_id"])
-        if rgid:
-            res = lib.rg_owned(
-                rgid, row.get("track_count"), ctx.cfg.owned_coverage
-            )
-        if res is None:
-            res = lib.owned(
-                row["artist"],
-                row["album"],
-                row.get("track_count"),
-                ctx.cfg.owned_coverage,
-            )
+        rgid = domain.extract_rgid_from_key(row["spotify_album_id"])
+        res = lib.lookup_owned(
+            row["artist"],
+            row["album"],
+            rgid=rgid,
+            expected_tracks=row.get("track_count"),
+            min_coverage=ctx.cfg.owned_coverage,
+        )
         owned = {
             "owned": res.owned,
             "have": res.item_count,
@@ -91,9 +80,11 @@ def attempts(ctx: Ctx):
 def request(ctx: Ctx):
     cfg = ctx.cfg
     rgid, artist, album = ctx.b("rgid"), ctx.b("artist"), ctx.b("album")
-    year = ctx.bi("year")
+    year = max(0, ctx.bi("year"))
     if not rgid or not artist or not album:
         return ctx.error(400, "rgid, artist, album required")
+    if blocklist.is_blocked(artist, cfg):
+        return ctx.error(409, f"artist {artist!r} is on the import blocklist")
     if not ctx.bb("force"):
         have = common.already_have(cfg, artist, album, rgid=rgid)
         if have:
@@ -108,7 +99,7 @@ def request(ctx: Ctx):
     key = f"request:rg:{rgid}"
     with common.state(cfg) as st:
         added = st.upsert_want(
-            key, artist, album, year, None, "request", resurrect=True
+            key, artist, album, year, None, "request", resurrect=True, cfg=cfg
         )
         if added:
             st.log_event("request", artist, album, "via ui")
@@ -125,6 +116,8 @@ def request_artist(ctx: Ctx):
     artist_id, name = ctx.b("id"), ctx.b("name")
     if not artist_id or not name:
         return ctx.error(400, "id and name required")
+    if blocklist.is_blocked(name, cfg):
+        return ctx.error(409, f"artist {name!r} is on the import blocklist")
     try:
         albums = mb.artist_release_groups(artist_id)
     except mb.MBUnavailable:
@@ -158,6 +151,7 @@ def request_artist(ctx: Ctx):
                 None,
                 "request",
                 resurrect=True,
+                cfg=cfg,
             )
     if added:
         common.spawn_pass()
@@ -177,7 +171,7 @@ def request_bulk(ctx: Ctx):
         return ctx.error(400, "items: 1-200 required")
     force = ctx.bb("force")
     backfill: list[tuple[str, str]] = []
-    skipped = added = 0
+    skipped = added = blocked = 0
     with common.state(cfg) as st:
         for it in items:
             if not isinstance(it, dict):
@@ -187,16 +181,19 @@ def request_bulk(ctx: Ctx):
             album = str(it.get("album", "")).strip()
             if not rgid or not artist or not album:
                 continue
+            if blocklist.is_blocked(artist, cfg):
+                blocked += 1
+                continue
             if not force and common.already_have(cfg, artist, album, rgid=rgid):
                 skipped += 1
                 continue
             try:
-                year = int(it.get("year") or 0)
+                year = max(0, int(it.get("year") or 0))
             except (TypeError, ValueError):
                 year = 0
             key = f"request:rg:{rgid}"
             if st.upsert_want(
-                key, artist, album, year, None, "request", resurrect=True
+                key, artist, album, year, None, "request", resurrect=True, cfg=cfg
             ):
                 added += 1
                 backfill.append((key, rgid))
@@ -205,7 +202,9 @@ def request_bulk(ctx: Ctx):
         common.fetch_counts_async(cfg, backfill)
     if added:
         common.spawn_pass()
-    return ctx.json(200, {"added": added, "skipped_owned": skipped})
+    return ctx.json(
+        200, {"added": added, "skipped_owned": skipped, "skipped_blocked": blocked}
+    )
 
 
 @post("/api/add")
@@ -214,6 +213,12 @@ def add(ctx: Ctx):
     artist, album = ctx.b("artist"), ctx.b("album")
     if not artist or not album:
         return ctx.error(400, "artist and album required")
+    if blocklist.is_blocked(artist, cfg):
+        return ctx.error(409, f"artist {artist!r} is on the import blocklist")
+    year = ctx.bi("year")
+    tracks = ctx.bi("tracks")
+    if year < 0 or tracks < 0:
+        return ctx.error(400, "year and tracks must be non-negative")
     if not ctx.bb("force"):
         have = common.already_have(cfg, artist, album)
         if have:
@@ -223,10 +228,11 @@ def add(ctx: Ctx):
             f"manual:{norm_artist(artist)}:{norm_album(album)}",
             artist,
             album,
-            ctx.bi("year"),
-            ctx.bi("tracks") or None,
+            year,
+            tracks or None,
             "manual",
             resurrect=True,
+            cfg=cfg,
         )
         if new:
             st.log_event("request", artist, album, "manual add via ui")
@@ -310,9 +316,15 @@ def edit(ctx: Ctx):
     if ctx.b("album"):
         kwargs["album"] = ctx.b("album")
     if "track_count" in ctx.body:
-        kwargs["track_count"] = ctx.bi("track_count") or None
+        tc = ctx.bi("track_count")
+        if tc < 0:
+            return ctx.error(400, "track_count must be non-negative")
+        kwargs["track_count"] = tc or None
     if "year" in ctx.body:
-        kwargs["year"] = ctx.bi("year")
+        yr = ctx.bi("year")
+        if yr < 0:
+            return ctx.error(400, "year must be non-negative")
+        kwargs["year"] = yr
     if not kwargs:
         return ctx.error(400, "nothing to change")
     with common.state(ctx.cfg) as st:
@@ -337,7 +349,12 @@ def candidates(ctx: Ctx):
     if want_obj is None:
         return ctx.error(404, "unknown want")
     from hunter.pipeline import search_texts_for_want
-    from hunter.slskd_client import SlskdClient, SlskdError, rank_candidates
+    from hunter.slskd_client import (
+        SlskdClient,
+        SlskdError,
+        candidate_to_dict,
+        rank_candidates,
+    )
 
     texts = (
         [ctx.b("text")]
@@ -366,31 +383,15 @@ def candidates(ctx: Ctx):
                     break
     except SlskdError as exc:
         return ctx.error(502, f"slskd: {exc}")
-    out = [
-        {
-            "username": c.username,
-            "dir": c.dir,
-            "dir_leaf": c.dir.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1],
-            "count": c.audio_count,
-            "lossless": c.lossless,
-            "bitrate": c.avg_bitrate,
-            "queue": c.queue_length,
-            "slot": c.has_free_slot,
-            "tried": (c.username, c.dir) in tried,
-            "size": sum(int(f.get("size") or 0) for f in c.files),
-            "files": [
-                {"filename": f.get("filename"), "size": f.get("size")}
-                for f in c.files
-            ][:80],
-        }
-        for c in ranked[:30]
-    ]
+    out = [candidate_to_dict(c, max_files=80, tried=tried) for c in ranked[:30]]
     return ctx.json(200, {"candidates": out, "query": used})
 
 
 @post("/api/grab")
 def grab(ctx: Ctx):
     cfg = ctx.cfg
+    if not cfg.slskd_configured:
+        return ctx.error(400, "slskd not configured")
     want_id = ctx.body.get("id")
     username, dir_ = ctx.b("username"), ctx.b("dir")
     files = ctx.body.get("files")
@@ -400,9 +401,10 @@ def grab(ctx: Ctx):
         or not username
         or not isinstance(files, list)
         or not files
+        or len(files) > _MAX_ENQUEUE_FILES
         or not all(isinstance(f, dict) and f.get("filename") for f in files)
     ):
-        return ctx.error(400, "id, username, files required")
+        return ctx.error(400, f"id, username, and 1-{_MAX_ENQUEUE_FILES} files required")
     with common.state(cfg) as st:
         w = st.get_want(want_id)
         if w is None:
@@ -565,6 +567,10 @@ def resolve_url(ctx: Ctx):
                     ),
                 },
             )
+        if blocklist.is_blocked(sp_album.artist, cfg):
+            return ctx.error(
+                409, f"artist {sp_album.artist!r} is on the import blocklist"
+            )
         with common.state(cfg) as st:
             st.upsert_want(
                 f"manual:{norm_artist(sp_album.artist)}:{norm_album(sp_album.name)}",
@@ -574,6 +580,7 @@ def resolve_url(ctx: Ctx):
                 sp_album.total_tracks or None,
                 "manual",
                 resurrect=True,
+                cfg=cfg,
             )
             st.log_event(
                 "request",
@@ -585,7 +592,7 @@ def resolve_url(ctx: Ctx):
         return ctx.json(
             200,
             {
-                "kind": "playlist",
+                "kind": "queued",
                 "detail": (
                     f"No MusicBrainz match for {sp_album.artist} — {sp_album.name};"
                     " queued as a free-text want instead."

@@ -146,7 +146,7 @@ class TestScheduler(unittest.TestCase):
 
             with patch("hunter.scheduler.HunterConfig.from_env", return_value=cfg), \
                  patch("hunter.downloads.recover_on_startup") as mock_rec, \
-                 patch("hunter.webui.start_ui", return_value=http_srv), \
+                 patch("hunter.web.server.start_ui", return_value=http_srv), \
                  patch("hunter.jobs.Jobs", return_value=fake_jobs), \
                  patch("hunter.scheduler.subprocess.Popen", return_value=MagicMock()), \
                  patch("hunter.scheduler._wait_for_pass", side_effect=fake_wait), \

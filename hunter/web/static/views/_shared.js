@@ -1,7 +1,81 @@
 /* Shared drawers + widgets used across views: want detail, candidate picker,
    job log viewer, library album manager, MusicBrainz artist discography,
    the guarded modify dialog. */
-import { api, h, mount, clear, fmt, toast, errToast, busy, action, drawer, modal, confirm, cover, artUrl, libArtUrl, navigate, link, qs, refreshStatusSoon, store, can } from "../app.js";
+import { api, h, mount, clear, fmt, toast, errToast, busy, action, drawer, modal, confirm, cover, artUrl, libArtUrl, navigate, link, qs, refreshStatusSoon, store, can, sel, setQuery, onCleanup } from "../app.js";
+import { invalidateFacetCache } from "./_filters.js";
+
+// ---------- shared UI primitives ----------
+export const quoteArg = (a) => (a === "" || /[\s"'\\]/.test(a)) ? JSON.stringify(a) : a;
+export const coverArtUrl = (a) => (a.has_art && (a.id || a.album_id)) ? libArtUrl(a.id || a.album_id) : (a.rgid ? artUrl(a.rgid) : "");
+
+export function statCard(k, v, d, hrefOrClick, cls = "") {
+  const attrs = typeof hrefOrClick === "function" ? { class: "stat " + cls, onClick: hrefOrClick } : { class: "stat " + cls, href: hrefOrClick };
+  return h(typeof hrefOrClick === "function" ? "div" : "a", attrs, h("div", { class: "k" }, k), h("div", { class: "v" }, v), d ? h("div", { class: "d" }, d) : null);
+}
+
+export function debouncedInput({ placeholder = "", value = "", delay = 300, cls = "input", type = "search", onInput, style, ...rest } = {}) {
+  let timer = null;
+  onCleanup(() => clearTimeout(timer));
+  const inp = h("input", { class: cls, type, placeholder, value, enterkeyhint: "search", style, ...rest });
+  inp.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(() => onInput(inp.value.trim()), delay); });
+  return inp;
+}
+
+export function createTabs(defs, initialTab, onSwitch, { switchQuery = {} } = {}) {
+  let tab = defs.some(([k]) => k === initialTab) ? initialTab : defs[0][0];
+  let tabGen = 0, stopSubPoll = null, lastCounts = null;
+  const el = h("div", { class: "tabs" });
+  const out = h("div", {});
+  const clearPoll = () => { if (stopSubPoll) { stopSubPoll(); stopSubPoll = null; } };
+  onCleanup(clearPoll);
+  const paint = (counts) => {
+    if (counts !== undefined) lastCounts = counts;
+    mount(el, ...defs.map(([k, l]) => {
+      const n = lastCounts && lastCounts[k] !== undefined && lastCounts[k] !== null ? lastCounts[k] : null;
+      return h("button", { class: k === tab ? "active" : "", onClick: () => switchTo(k) }, l, n !== null ? h("span", { class: "n" }, fmt.num(n)) : null);
+    }));
+  };
+  const go = () => {
+    clearPoll();
+    sel.clear();
+    const myGen = ++tabGen;
+    const alive = () => myGen === tabGen && out.isConnected;
+    return onSwitch(tab, { alive, out, setPoll: (fn) => { clearPoll(); stopSubPoll = fn; } });
+  };
+  const switchTo = (k, extraQuery = {}) => {
+    if (!defs.some(([id]) => id === k)) return;
+    tab = k;
+    setQuery({ ...switchQuery, tab, ...extraQuery });
+    paint();
+    go();
+  };
+  paint();
+  return { el, out, get tab() { return tab; }, paint, go, switchTo };
+}
+
+export async function confirmBeetsRun(body, label = "Run") {
+  let res;
+  try {
+    res = await api("/api/beets/run", body);
+  } catch (e) {
+    if (e.status === 409 && e.data?.needs_confirm) {
+      const n = e.data.count;
+      if (!(await confirm({ title: `${label}: ${fmt.num(n)} rows?`, body: `This will touch ${fmt.num(n)} rows in beets. Confirm to run.`, ok: "Run", danger: true, typed: n > 50 ? String(n) : "" }))) return null;
+      res = await api("/api/beets/run", { ...body, confirm_count: n });
+    } else throw e;
+  }
+  return res;
+}
+
+export async function queueDownload({ title, item_ids = [], album_ids = [], artists = [] }) {
+  const est = await api("/api/downloads/estimate", { item_ids, album_ids, artists });
+  if (!est.count) { toast("Nothing on disk to download", "warn"); return null; }
+  if (est.bytes > est.max_bundle_bytes) { toast(`${fmt.bytes(est.bytes)} exceeds the ${fmt.bytes(est.max_bundle_bytes)} bundle cap — split the selection`, "bad", 6000); return null; }
+  const r = await api("/api/downloads", { title, item_ids, album_ids, artists });
+  if (!r.ok) { toast(r.error, "bad"); return null; }
+  toast(h("span", {}, `Bundling ${fmt.num(est.count)} files · ${fmt.bytes(est.bytes)} — `, h("a", { href: "#/downloads", class: "acc" }, "open Downloads")), "ok", 6000);
+  return r.bundle;
+}
 
 // ---------- small widgets ----------
 export const statusBadge = (s) => h("span", { class: "badge " + s }, s);
@@ -67,23 +141,24 @@ export function setLog(el, text) {
 // ---------- want drawer ----------
 export async function openWant(id) {
   const d = drawer({ title: "Want", body: h("div", { class: "skel" }, h("div"), h("div")) });
-  let data;
-  try { data = await api(`/api/want?id=${encodeURIComponent(id)}`); } catch (e) { mount(d.body, h("div", { class: "notice bad" }, e.message)); return; }
-  const w = data.want;
-  d.setTitle(`${w.artist} — ${w.album}`);
-  const rg = w.spotify_album_id?.startsWith("request:rg:") || w.spotify_album_id?.startsWith("release:rg:") ? w.spotify_album_id.slice(11) : "";
   const op = can("operator");
-  const render = () => {
+  const load = async () => {
+    let data;
+    try { data = await api(`/api/want?id=${encodeURIComponent(id)}`); } catch (e) { mount(d.body, h("div", { class: "notice bad" }, e.message)); return; }
+    if (!d.body.isConnected) return;
+    const w = data.want;
+    d.setTitle(`${w.artist} — ${w.album}`);
+    const rg = w.spotify_album_id?.startsWith("request:rg:") || w.spotify_album_id?.startsWith("release:rg:") ? w.spotify_album_id.slice(11) : "";
     mount(d.body,
       h("div", { class: "row mb" }, rg ? cover(artUrl(rg), { size: "lg" }) : cover("", { size: "lg" }),
         h("div", { class: "stack", style: { gap: "4px" } }, h("div", { class: "row" }, statusBadge(w.status), h("span", { class: "badge dim" }, w.source), w.year ? h("span", { class: "muted" }, w.year) : null),
           h("div", { class: "muted small" }, `${w.track_count ? w.track_count + " tracks · " : ""}${w.attempts} grab${w.attempts === 1 ? "" : "s"} · ${w.search_misses || 0} search misses · priority ${w.priority ?? 0}`),
           data.owned ? h("div", { class: "row small" }, data.owned.owned ? h("span", { class: "badge ok" }, `owned ${data.owned.have}/${data.owned.expected || "?"}`) : h("span", { class: "badge dim" }, `library: ${data.owned.have}/${data.owned.expected || "?"}`),
-            data.owned.album_id ? h("a", { class: "btn xs ghost", href: "#", onClick: (e) => { e.preventDefault(); openAlbum(data.owned.album_id); } }, "Open in library") : null) : null)),
+            data.owned.album_id ? h("a", { class: "btn xs ghost", href: "#", onClick: (e) => { e.preventDefault(); d.dismiss(); openAlbum(data.owned.album_id); } }, "Open in library") : null) : null)),
       h("div", { class: "row mb" },
-        op ? h("button", { class: "btn sm primary", onClick: action(null, async () => { await api("/api/retry", { id }); toast("Retrying now — pass spawned", "ok"); refreshStatusSoon(); }) }, "Retry now") : null,
+        op ? h("button", { class: "btn sm primary", onClick: action(null, async () => { await api("/api/retry", { id }); toast("Retrying now — pass spawned", "ok"); refreshStatusSoon(); load(); }) }, "Retry now") : null,
         op ? h("button", { class: "btn sm", onClick: () => pickCandidates(id, { title: `${w.artist} — ${w.album}`, tracks: w.track_count }) }, "Pick source…") : null,
-        op ? h("button", { class: "btn sm", onClick: () => editWant(w, () => openWant(id)) }, "Edit") : null,
+        op ? h("button", { class: "btn sm", onClick: () => editWant(w, load) }, "Edit") : null,
         h("button", { class: "btn sm ghost", onClick: () => navigate(link("discover", { q: `${w.artist} ${w.album}` })) }, "Search MB"),
         h("span", { class: "ml-auto" }),
         op && ["wanted", "grabbed", "exhausted"].includes(w.status) ? h("button", { class: "btn sm danger", onClick: action(null, async () => { await api("/api/drop", { id }); toast("Dropped"); refreshStatusSoon(); d.close(); }) }, "Drop") : null),
@@ -100,7 +175,7 @@ export async function openWant(id) {
       h("div", { class: "section-title" }, "History"),
       data.events.length ? h("div", { class: "timeline card tight" }, ...data.events.map(e => h("div", { class: "tl" }, h("span", { class: "ts" }, fmt.datetime(e.ts)), h("span", { class: "badge dim" }, e.kind), h("span", { class: "what" }, e.detail)))) : h("div", { class: "hint" }, "No events."));
   };
-  render();
+  await load();
 }
 
 export function editWant(w, after) {
@@ -149,17 +224,28 @@ export function candidateRow(c, { tracks = null, onGrab, label = "Grab" } = {}) 
 }
 
 // Resolve when a job leaves "running" (polls /api/library/job_result every 2 s,
-// gives up after an hour). Used to refresh lists only once the beets-side work
-// is really done.
+// stops on route change or auth/repeated server error). Returns null if cancelled.
 export function waitForJob(id, { every = 2000, maxMs = 3_600_000 } = {}) {
   const t0 = Date.now();
+  let stopped = false, timer = null, errs = 0;
   return new Promise((resolve) => {
+    const cancel = () => { stopped = true; clearTimeout(timer); resolve(null); };
+    onCleanup(cancel);
     const tick = async () => {
+      if (stopped) return;
       let r = null;
-      try { r = await api(`/api/library/job_result?id=${encodeURIComponent(id)}`); } catch (e) { if (e.status === 404) return resolve({ job: {}, result: null }); }
+      try {
+        r = await api(`/api/library/job_result?id=${encodeURIComponent(id)}`);
+        errs = 0;
+      } catch (e) {
+        if (e.status === 401 || e.status === 403 || e.status === 404 || ++errs >= 3) {
+          return resolve({ job: {}, result: null });
+        }
+      }
+      if (stopped) return;
       if (r && r.job && r.job.status !== "running") return resolve(r);
       if (Date.now() - t0 > maxMs) return resolve(r || { job: {}, result: null });
-      setTimeout(tick, document.hidden ? every * 3 : every);
+      timer = setTimeout(tick, document.hidden ? every * 3 : every);
     };
     tick();
   });
@@ -195,27 +281,33 @@ export async function openJob(id) {
         job.status !== "running" && job.mode === "dry-run" && job.kind !== "hunter" ? h("button", { class: "btn sm primary", onClick: action(null, () => rerun(job, true)) }, "Run for real") : null,
         job.status !== "running" ? h("button", { class: "btn sm", onClick: action(null, () => rerun(job, job.mode === "apply")) }, "Re-run") : null),
       h("div", { class: "mono xs muted mb", style: { overflowWrap: "anywhere" } }, job.command),
-      job.status === "running" ? h("div", { class: "mb" }, h("div", { class: "progress lg striped" + (p.pct === null ? "" : "") }, h("div", { style: { width: (p.pct ?? 100) + "%", opacity: p.pct === null ? ".35" : "1" } })), h("div", { class: "xs muted mt", style: { marginTop: "4px" } }, p.pct !== null ? `${p.pct}%${p.total ? ` · ${p.done}/${p.total}` : ""}` : "running…", p.last ? " · " + p.last : "")) : null,
+      job.status === "running" ? h("div", { class: "mb" }, h("div", { class: "progress lg striped" }, h("div", { style: { width: (p.pct ?? 100) + "%", opacity: p.pct === null ? ".35" : "1" } })), h("div", { class: "xs muted mt", style: { marginTop: "4px" } }, p.pct !== null ? `${p.pct}%${p.total ? ` · ${p.done}/${p.total}` : ""}` : "running…", p.last ? " · " + p.last : "")) : null,
       job.meta?.query ? h("div", { class: "hint mb" }, "query: ", h("code", { class: "mono" }, job.meta.query)) : null);
     setLog(logEl, r.text || "(no output yet)");
     if (follow) logEl.scrollTop = logEl.scrollHeight;
     if (job.status === "running" && !stopped) timer = setTimeout(tick, 2000);
   };
-  const quoteArg = (a) => (a === "" || /[\s"'\\]/.test(a)) ? JSON.stringify(a) : a;
+  const stripBeetWrapper = (argv, cmdName) => {
+    const list = argv || [];
+    if (cmdName) {
+      const idx = list.indexOf(cmdName);
+      if (idx >= 0) return list.slice(idx);
+    }
+    const beetIdx = list.findIndex(t => /(^|\/)beet$/.test(t));
+    if (beetIdx >= 0) {
+      let i = beetIdx + 1;
+      while (i < list.length && list[i].startsWith("-")) i += (["-c", "--config", "-l", "--library", "-d", "--directory"].includes(list[i]) ? 2 : 1);
+      return list.slice(i);
+    }
+    return list.slice(1);
+  };
   const rerun = async (job, apply) => {
-    if (job.kind === "script" && job.meta?.script) { const r = await api("/api/beets/scripts/run", { id: job.meta.script, apply, date: job.meta.date, limit: job.meta.limit }); if (r.ok) { d.close(); openJob(r.job.id); } else toast(r.error, "bad"); return; }
+    if (job.kind === "script" && job.meta?.script) { const r = await api("/api/beets/scripts/run", { id: job.meta.script, apply, date: job.meta.date, limit: job.meta.limit }); if (r.ok) { d.dismiss(); openJob(r.job.id); } else toast(r.error, "bad"); return; }
     if (job.kind === "beet") {
-      const argv = (job.argv || []).slice(2).filter(a => a !== "-y");
+      const argv = stripBeetWrapper(job.argv, job.meta?.cmd).filter(a => a !== "-y");
       const raw = argv.map(quoteArg).join(" ");
-      const r = await api("/api/beets/run", { raw, apply, confirm_count: -1 }).catch(async (e) => {
-        if (e.status === 409 && e.data.needs_confirm) {
-          if (await confirm({ title: `Touch ${e.data.count} rows?`, body: "Blast radius exceeds the soft cap. Confirm to run.", ok: "Run", danger: true })) {
-            return api("/api/beets/run", { raw, apply, confirm_count: e.data.count });
-          }
-        }
-        throw e;
-      });
-      if (r?.ok) { d.close(); openJob(r.job.id); } else if (r?.error) toast(r.error, "bad");
+      const r = await confirmBeetsRun({ raw, apply, confirm_count: -1 }, "Re-run");
+      if (r?.ok) { d.dismiss(); openJob(r.job.id); } else if (r?.error) toast(r.error, "bad");
       return;
     }
     if (job.kind === "hunter") {
@@ -241,7 +333,7 @@ export async function openJob(id) {
         }
       }
       const r = await api("/api/hunter/run", { command: job.argv[3], flags, ints, verbose });
-      if (r.ok) { d.close(); openJob(r.job.id); } else toast(r.error, "bad");
+      if (r.ok) { d.dismiss(); openJob(r.job.id); } else toast(r.error, "bad");
       return;
     }
     toast("cannot re-run this job kind", "warn");
@@ -280,7 +372,7 @@ export async function openAlbum(albumId) {
         a.rgid ? h("button", { class: "btn sm ghost", onClick: () => navigate(link("discover", { q: `${a.artist} ${a.album}` })) }, "Search MB") : null,
         op ? h("button", { class: "btn sm ghost", onClick: () => navigate(link("discover", { q: `${a.artist} ${a.album}`, tab: "soulseek" })) }, "Browse Soulseek") : null),
       h("div", { class: "section-title" }, "Files"),
-      h("div", { class: "row mb" }, h("button", { class: "btn sm", onClick: action(null, async () => { const { queueDownload } = await import("./_filters.js"); await queueDownload({ title: `${a.artist} — ${a.album}`, album_ids: [albumId] }); }) }, "Download album (zip)"), h("span", { class: "muted small" }, `${a.items.length} files · ${fmt.mmss(a.length)}`)),
+      h("div", { class: "row mb" }, h("button", { class: "btn sm", onClick: action(null, async () => { await queueDownload({ title: `${a.artist} — ${a.album}`, album_ids: [albumId] }); }) }, "Download album (zip)"), h("span", { class: "muted small" }, `${a.items.length} files · ${fmt.mmss(a.length)}`)),
       op ? h("div", { class: "section-title" }, "beets") : null,
       op ? h("div", { class: "row mb" },
         h("button", { class: "btn sm", onClick: (e) => beet(e.currentTarget, "fetchart", { force: a.has_art }) }, a.has_art ? "Re-fetch art" : "Fetch art"),
@@ -318,11 +410,11 @@ export async function openTrack(itemId) {
   const keys = ["title", "artist", "album", "albumartist", "track", "tracktotal", "disc", "year", "genre", "bpm", "initial_key", "format", "bitrate", "samplerate", "bitdepth", "length", "mb_trackid", "mb_albumid", "mb_artistid", "acoustid_id", "isrc", "label", "comments", "composer", "lyricist", "added", "mtime", "path"];
   const d = drawer({ title: `${t.artist} — ${t.title}`, narrow: true, body: h("div", {},
     h("div", { class: "row mb" },
-      op ? h("button", { class: "btn sm primary", onClick: () => modifyDialog({ itemIds: [itemId], current: { title: t.title, artist: t.artist, genre: t.genre, track: t.track, bpm: t.bpm }, after: () => { d.close(); openTrack(itemId); } }) }, "Edit tags…") : null,
+      op ? h("button", { class: "btn sm primary", onClick: () => modifyDialog({ itemIds: [itemId], current: { title: t.title, artist: t.artist, genre: t.genre, track: t.track, bpm: t.bpm }, after: () => { d.dismiss(); openTrack(itemId); } }) }, "Edit tags…") : null,
       op ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/library/beet", { action: "write", item_id: itemId }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, "Write") : null,
       op ? h("button", { class: "btn sm", onClick: action(null, async () => { const r = await api("/api/library/beet", { action: "fingerprint", item_id: itemId }); if (r.ok) openJob(r.job.id); else toast(r.error, "bad"); }) }, "Fingerprint") : null,
       h("a", { class: "btn sm", href: `/api/dl/track?id=${encodeURIComponent(itemId)}`, download: "" }, "Download"),
-      h("button", { class: "btn sm ghost", onClick: () => { d.close(); openAlbum(t.album_id); } }, "Album"),
+      h("button", { class: "btn sm ghost", onClick: () => { d.dismiss(); openAlbum(t.album_id); } }, "Album"),
       op ? h("button", { class: "btn sm danger ml-auto", onClick: () => removeDialog({ itemIds: [itemId], title: `${t.artist} — ${t.title}`, after: () => d.close() }) }, "Remove…") : null),
     !t.exists ? h("div", { class: "notice bad mb" }, h("div", { class: "body" }, "File not found on disk at this path.")) : null,
     h("table", { class: "mini-tbl" }, ...keys.filter(k => t[k] !== undefined && t[k] !== "" && t[k] !== null).map(k => h("tr", {}, h("td", {}, k), h("td", { style: { overflowWrap: "anywhere" } }, k === "length" ? fmt.mmss(t[k]) : k === "added" || k === "mtime" ? fmt.datetime(t[k]) : k === "bitrate" ? Math.round(t[k] / 1000) + " kbps" : String(t[k]))))),
@@ -360,7 +452,11 @@ export function modifyDialog({ albumId = null, itemIds = null, query = "", album
     }
     if (!r.ok) throw new Error(r.error);
     toast(apply ? "modify running — check the job log" : "dry-run started — review the log, then apply", apply ? "ok" : "");
-    openJob(r.job.id); if (apply && after) setTimeout(after, 1500);
+    openJob(r.job.id);
+    if (apply) {
+      invalidateFacetCache();
+      if (after) waitForJob(r.job.id).then((res) => { if (res) after(r, res); });
+    }
     return true;
   };
   modal({ title: "Modify tags", wide: true, body: h("div", { class: "stack" },
@@ -427,8 +523,10 @@ export function removeDialog({ artists = [], albumIds = [], itemIds = [], title 
       // underneath only reflects that once it has finished. Refresh then,
       // not now (the old code refreshed immediately and showed stale rows).
       waitForJob(r.job.id).then((res) => {
+        if (!res) return;
         const j = res.job || {}, out = res.result || {};
         const good = out.ok === true || j.exit_code === 0 || j.status === "ok" || j.status === "done";
+        invalidateFacetCache();
         toast(good ? `Removal finished · ${fmt.num(out.moved ?? 0)} files → quarantine · ${fmt.num(out.albums_removed ?? 0)} albums${out.errors ? ` · ${out.errors} errors` : ""}` : `Removal ended: ${j.status || "unknown"} — check the job log`, good && !out.errors ? "ok" : "warn", 7000);
         refreshStatusSoon(); after && after(r, res);
       });
@@ -498,7 +596,8 @@ export async function openRemoval(id) {
   const undoBtn = r.undone_ts || !op ? null : h("button", { class: "btn sm primary", onClick: action(null, async () => {
     if (!(await confirm({ title: "Undo this removal?", body: `Moves ${fmt.num(r.tracks)} files back to their original paths (never overwriting) and re-inserts the exact beets rows${r.blocked?.length ? `, and unblocks ${r.blocked.join(", ")}` : ""}.`, ok: "Undo" }))) return;
     const j = await api("/api/library/removal/undo", { id: r.id }); if (!j.ok) throw new Error(j.error);
-    toast("Undo started", "ok"); d.close(); openJob(j.job.id);
+    invalidateFacetCache();
+    toast("Undo started", "ok"); d.dismiss(); openJob(j.job.id);
   }) }, "Undo removal");
   mount(d.body,
     h("div", { class: "row mb" }, r.undone_ts ? h("span", { class: "badge ok" }, `undone ${fmt.datetime(r.undone_ts)}`) : h("span", { class: "badge bad" }, "in quarantine"), r.errors ? h("span", { class: "badge warn" }, `${r.errors} errors`) : null, r.blocked?.length ? h("span", { class: "badge dim" }, `blocked: ${r.blocked.join(", ")}`) : null, h("span", { class: "muted small" }, `${fmt.datetime(r.ts)} · by ${r.requested_by || "?"}${r.reason ? ` · ${r.reason}` : ""}`), h("span", { class: "ml-auto" }), undoBtn),

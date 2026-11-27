@@ -33,13 +33,18 @@ _LOSSY_RE = re.compile(
     re.I,
 )
 _LOSSLESS_RE = re.compile(
-    r"\b(flac|alac|ape|wav|lossless|24 ?bit|16 ?bit|dsd)\b", re.I
+    r"\b(flac|alac|ape|wav|aiff|wv|dsf|lossless|24[ -]?bit|16[ -]?bit|dsd)\b", re.I
 )
 _DISCOGRAPHY_RE = re.compile(
     r"\b(discograph|complete works|anthology|box ?set|collection of)\w*", re.I
 )
 _MIN_BYTES = 3 * 1024 * 1024           # filter spam/sub-3MB junk (allows EPs/singles & size==0)
 _MAX_BYTES = 6 * 1024 * 1024 * 1024    # a 6 GB release is a discography
+
+
+def is_prowlarr_key(username: str | None) -> bool:
+    """Return True when a want's ``grabbed_username`` originated from Prowlarr."""
+    return bool(username and str(username).startswith("prowlarr:"))
 
 
 class ProwlarrError(RuntimeError):
@@ -98,8 +103,10 @@ class ProwlarrClient:
             )
         except HttpError as exc:
             raise ProwlarrError(f"search failed: {exc}") from exc
+        if not isinstance(rows, list):
+            raise ProwlarrError(f"search failed: expected list, got {type(rows).__name__}")
         out: list[Release] = []
-        for row in rows if isinstance(rows, list) else []:
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             try:
@@ -133,6 +140,9 @@ def _flatten_categories(cats: Any) -> set[int]:
 
 
 def _parse(row: dict) -> Release:
+    raw_guid = row.get("guid")
+    if raw_guid is None or not str(raw_guid).strip():
+        raise ValueError("missing guid")
     cats = _flatten_categories(row.get("categories"))
     title = str(row.get("title") or "")
     is_lossy_tag = bool(_LOSSY_RE.search(title))
@@ -140,14 +150,16 @@ def _parse(row: dict) -> Release:
         (_LOSSLESS_CATEGORY in cats) or bool(_LOSSLESS_RE.search(title))
     )
     proto = str(row.get("protocol") or "torrent").strip().lower() or "torrent"
+    raw_seeders = row.get("seeders")
+    seeders = raw_seeders if (isinstance(raw_seeders, int) and not isinstance(raw_seeders, bool)) else None
     return Release(
         title=title,
-        guid=str(row["guid"]),
+        guid=str(raw_guid),
         indexer_id=int(row["indexerId"]),
         indexer=str(row.get("indexer") or row["indexerId"]),
         protocol=proto,
         size=int(row.get("size") or 0),
-        seeders=row.get("seeders") if isinstance(row.get("seeders"), int) else None,
+        seeders=seeders,
         lossless=lossless,
         age_hours=float(row.get("ageHours") or 0.0),
     )
@@ -167,12 +179,12 @@ def rank(
     Uses ``domain.extract_match_tokens`` + ``domain.tokens_match_path`` with
     ``require_all=True`` so short names (U2, R.E.M., The XX) match safely and
     substring false positives (``air`` in ``chair``) are rejected. Fails closed
-    if artist tokens are empty.
+    if artist or album tokens are empty.
     """
     a_tokens = extract_match_tokens(norm_artist(artist))
-    if not a_tokens:
-        return []
     b_tokens = extract_match_tokens(norm_album(album))
+    if not a_tokens or not b_tokens:
+        return []
     want_disco = bool(_DISCOGRAPHY_RE.search(album or ""))
     keep: list[Release] = []
     for r in releases:
@@ -189,7 +201,7 @@ def rank(
         hay = normalize(r.title)
         if not tokens_match_path(a_tokens, hay, require_all=True):
             continue
-        if b_tokens and not tokens_match_path(b_tokens, hay, require_all=True):
+        if not tokens_match_path(b_tokens, hay, require_all=True):
             continue
         keep.append(r)
     keep.sort(key=lambda r: (

@@ -6,20 +6,20 @@ requests and imports speak the same language.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import re
 import threading
 import time
 import urllib.parse
-from collections import Counter
-
-import requests
+from collections import Counter, OrderedDict
 
 from hunter.config import HunterConfig
+from hunter.domain import extract_year
 from hunter.http_client import (
     HttpError,
     HttpSession,
-    default_user_agent,
+    PoliteClient,
     parse_retry_after,
 )
 
@@ -32,35 +32,21 @@ _MAX_ATTEMPTS = 4          # MB sheds load with 503 constantly; ride it out
 _FRESH_TTL = 600           # a hit newer than this skips the network entirely
 _STALE_TTL = 86_400        # older hits still beat a hard failure (served + logged)
 
-_rate_lock = threading.Lock()
-_next_slot = 0.0
+_client = PoliteClient(timeout=MB_TIMEOUT, min_interval=_MIN_INTERVAL)
 _cache_lock = threading.Lock()
-_cache: dict[str, tuple[float, object]] = {}
-_thread_local = threading.local()
+_cache: OrderedDict[str, tuple[float, object]] = OrderedDict()
 
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}[\]^"~*?:\\/])')
+_LUCENE_BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
 
 
 def _user_agent(cfg: HunterConfig | None = None) -> str:
-    eff = cfg
-    if eff is None:
-        try:
-            eff = HunterConfig.from_env()
-        except Exception:                           # noqa: BLE001
-            eff = None
-    return default_user_agent(eff)
+    return _client.user_agent(cfg)
 
 
 def _session(cfg: HunterConfig | None = None) -> HttpSession:
     """Return a per-thread HttpSession with dynamically computed User-Agent."""
-    ua = _user_agent(cfg)
-    sess = getattr(_thread_local, "http", None)
-    if sess is None:
-        sess = HttpSession(timeout=MB_TIMEOUT, user_agent=ua)
-        _thread_local.http = sess
-    else:
-        sess.headers["User-Agent"] = ua
-    return sess
+    return _client.session(cfg)
 
 
 class MBUnavailable(RuntimeError):
@@ -68,39 +54,28 @@ class MBUnavailable(RuntimeError):
 
 
 def _escape_lucene(text: str) -> str:
-    """Escape Lucene special characters (+ - && || ! ( ) { } [ ] ^ \" ~ * ? : \\ /)."""
+    """Escape Lucene special characters and boolean operators (AND/OR/NOT)."""
     out = _LUCENE_SPECIAL_RE.sub(r"\\\1", text)
-    return out.replace("&&", r"\&\&").replace("||", r"\|\|")
-
-
-def _reserve_slot(min_interval: float = _MIN_INTERVAL) -> None:
-    """Reserve the next rate-limit timestamp under lock, then sleep outside it."""
-    global _next_slot
-    with _rate_lock:
-        now = time.monotonic()
-        slot = max(now, _next_slot)
-        _next_slot = slot + min_interval
-    delay = slot - now
-    if delay > 0:
-        time.sleep(delay)
+    out = out.replace("&&", r"\&\&").replace("||", r"\|\|")
+    return _LUCENE_BOOL_RE.sub(lambda m: m.group(1).lower(), out)
 
 
 def mb_get(path: str, params: dict, *, cfg: HunterConfig | None = None) -> dict:
     """Throttled, retried, cache-backed GET. Never raises on a transient MB
     hiccup when a cached copy (even stale) exists. Raises MBUnavailable only
     when there is genuinely nothing to serve after exhausting retries."""
-    global _next_slot
     key = path + "?" + urllib.parse.urlencode(sorted(params.items()))
     now = time.monotonic()
     with _cache_lock:
         hit = _cache.get(key)
-    if hit and now - hit[0] < _FRESH_TTL:
-        return hit[1]                                    # type: ignore[return-value]
+        if hit and now - hit[0] < _FRESH_TTL:
+            _cache.move_to_end(key)
+            return copy.deepcopy(hit[1])                 # type: ignore[return-value]
 
     last_err = ""
     http = _session(cfg)
     for attempt in range(_MAX_ATTEMPTS):
-        _reserve_slot()
+        _client.limiter.acquire()
         try:
             resp = http.get(
                 f"{MB}{path}",
@@ -112,8 +87,7 @@ def mb_get(path: str, params: dict, *, cfg: HunterConfig | None = None) -> dict:
             last_err = str(exc)
             if attempt + 1 < _MAX_ATTEMPTS:
                 delay = min(1.5 * (2 ** attempt), 8.0)
-                with _rate_lock:
-                    _next_slot = max(_next_slot, time.monotonic() + delay)
+                _client.limiter.push_back(delay)
             continue
 
         if resp.status_code == 200:
@@ -127,17 +101,16 @@ def mb_get(path: str, params: dict, *, cfg: HunterConfig | None = None) -> dict:
                 break
             with _cache_lock:
                 _cache[key] = (time.monotonic(), data)
-                if len(_cache) > 800:
-                    for k in list(_cache)[:400]:
-                        _cache.pop(k, None)
-            return data
+                _cache.move_to_end(key)
+                while len(_cache) > 800:
+                    _cache.popitem(last=False)
+            return copy.deepcopy(data)
 
-        # 503 (load-shed) and 429 (rate) are retryable; honor Retry-After (capped 30s).
-        if resp.status_code in (503, 429) and attempt + 1 < _MAX_ATTEMPTS:
+        # 502/503/504 (gateway/load-shed) and 429 (rate) are retryable.
+        if resp.status_code in (429, 502, 503, 504) and attempt + 1 < _MAX_ATTEMPTS:
             ra = parse_retry_after(resp.headers.get("Retry-After"), default=0.0, cap=30.0)
             delay = max(ra, min(1.5 * (2 ** attempt), 30.0))
-            with _rate_lock:
-                _next_slot = max(_next_slot, time.monotonic() + delay)
+            _client.limiter.push_back(delay)
             last_err = f"{resp.status_code}"
             continue
 
@@ -147,7 +120,7 @@ def mb_get(path: str, params: dict, *, cfg: HunterConfig | None = None) -> dict:
     # Exhausted. Fall back to a stale-but-usable cached copy before failing.
     if hit and (time.monotonic() - hit[0]) < _STALE_TTL:
         log.warning("MB %s failed (%s) — serving stale cache", path, last_err)
-        return hit[1]                                    # type: ignore[return-value]
+        return copy.deepcopy(hit[1])                     # type: ignore[return-value]
     raise MBUnavailable(f"MusicBrainz unavailable ({last_err})")
 
 
@@ -161,13 +134,8 @@ def credit(artist_credit: list | None) -> str:
     ).strip()
 
 
-def _parse_year(date_str: str | None) -> int:
-    y = (date_str or "")[:4]
-    return int(y) if len(y) == 4 and y.isdigit() else 0
-
-
 def rg_year(rg: dict) -> int:
-    return _parse_year(rg.get("first-release-date"))
+    return extract_year(rg.get("first-release-date"))
 
 
 def rg_track_count(rgid: str) -> int | None:
@@ -175,7 +143,7 @@ def rg_track_count(rgid: str) -> int | None:
     try:
         data = mb_get("/release", {"release-group": rgid, "inc": "media",
                                    "limit": 25})
-    except (MBUnavailable, requests.RequestException, ValueError, KeyError, TypeError):
+    except (MBUnavailable, ValueError, KeyError, TypeError):
         return None
     totals = []
     for rel in data.get("releases") or []:
@@ -253,7 +221,7 @@ def search(kind: str, query: str, offset: int = 0) -> list[dict]:
                 "song": rec.get("title", ""), "rgid": rg["id"],
                 "album": rg.get("title", rel.get("title", "")),
                 "artist": credit(rec.get("artist-credit")),
-                "year": rg_year(rg) or _parse_year(rel.get("date")),
+                "year": rg_year(rg) or extract_year(rel.get("date")),
                 "_clean": _rel_score(rel) == (0, 0, 0, 0),
             })
         out.sort(key=lambda e: not e.pop("_clean"))   # studio albums first
@@ -299,5 +267,7 @@ def artist_release_groups(artist_id: str) -> list[dict]:
             })
         if len(page) < 100:
             break
+    else:
+        log.info("MB artist_release_groups(%s) hit 500-RG cap", artist_id)
     rgs.sort(key=lambda r: (bool(r["secondary"]), -(r["year"] or 0)))
     return rgs

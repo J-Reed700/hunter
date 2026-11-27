@@ -97,7 +97,11 @@ class DownloadsTests(unittest.TestCase):
                  "files": [{"id": 1, "src": str(self.f1), "arc": "a.flac", "bytes": 11 * (1 << 30)}],
                  "bytes": 11 * (1 << 30), "count": 1, "missing": 0,
              }):
-            big_cfg = SimpleNamespace(**{**self.cfg.__dict__, "dl_max_bundle_bytes": 20 * (1 << 30)})
+            big_cfg = SimpleNamespace(**{
+                **self.cfg.__dict__,
+                "dl_max_bundle_bytes": 20 * (1 << 30),
+                "dl_keep_bytes": 30 * (1 << 30),
+            })
             rv = downloads.create(big_cfg, title="big", requested_by="viewer1", item_ids=[1], role="viewer")
             self.assertFalse(rv["ok"])
             self.assertIn("viewer", rv["error"])
@@ -125,7 +129,11 @@ class DownloadsTests(unittest.TestCase):
                  "files": [{"id": 1, "src": str(self.f1), "arc": "a.flac", "bytes": 6 * (1 << 30)}],
                  "bytes": 6 * (1 << 30), "count": 1, "missing": 0,
              }):
-            big_cfg = SimpleNamespace(**{**self.cfg.__dict__, "dl_max_bundle_bytes": 20 * (1 << 30)})
+            big_cfg = SimpleNamespace(**{
+                **self.cfg.__dict__,
+                "dl_max_bundle_bytes": 20 * (1 << 30),
+                "dl_keep_bytes": 30 * (1 << 30),
+            })
             rv2 = downloads.create(big_cfg, title="v_over", requested_by="viewer2", item_ids=[1], role="viewer")
             self.assertFalse(rv2["ok"])
             self.assertIn("20 GB", rv2["error"])

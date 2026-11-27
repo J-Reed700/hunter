@@ -1,12 +1,11 @@
 """Recovery — library <-> disk reconciliation, and re-requesting what is gone."""
 from __future__ import annotations
 
-from hunter import domain, recovery, storage
+from hunter import recovery, storage
 from hunter.web import common
 from hunter.web.router import get, post
 from hunter.web.server import Ctx
 
-log = common.log
 _MAX_REQUEUE = 5000
 
 
@@ -110,35 +109,8 @@ def requeue(ctx: Ctx):
             },
         )
 
-    added = skipped = 0
     with common.state(ctx.cfg) as st:
-        with st.transaction():
-            for alb in recovery.albums_of(still_gone):
-                key = f"recovery:{alb['key']}"
-                track_total = alb.get("album_track_total") or alb.get("tracks") or None
-                try:
-                    if st.upsert_want(
-                        key,
-                        alb["artist"],
-                        alb["album"],
-                        alb.get("year") or 0,
-                        track_total,
-                        "recovery",
-                        resurrect=True,
-                    ):
-                        st.set_priority(key, domain.PRIORITY_OPERATOR)
-                        st.log_event(
-                            "request",
-                            alb["artist"],
-                            alb["album"],
-                            f"recovery: {alb['tracks']} track(s) missing from disk",
-                        )
-                        added += 1
-                    else:
-                        skipped += 1
-                except Exception as exc:                      # noqa: BLE001
-                    log.warning("recovery requeue failed for %s — %s", key, exc)
-                    skipped += 1
+        added, skipped = recovery.requeue_albums(ctx.cfg, st, still_gone)
     if added:
         common.spawn_pass()
     return ctx.json(

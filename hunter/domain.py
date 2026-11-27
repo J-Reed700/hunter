@@ -20,6 +20,8 @@ LOSSLESS_FORMATS: frozenset[str] = frozenset({
     "FLAC", "ALAC", "WAV", "AIFF", "APE", "WV", "DSF",
 })
 
+LOSSLESS_SQL: str = "(" + ",".join(f"'{fmt}'" for fmt in sorted(LOSSLESS_FORMATS)) + ")"
+
 AUDIO_EXTENSIONS: frozenset[str] = frozenset({
     ".flac", ".mp3", ".m4a", ".m4p", ".aac", ".ogg", ".opus",
     ".wav", ".aiff", ".aif", ".alac", ".ape", ".wv", ".dsf",
@@ -196,6 +198,22 @@ def _match_prefix(s: str, prefix: str) -> str | None:
     return None
 
 
+def _resolve_mapped_root(
+    raw: str,
+    base: Path,
+    configured_root: Any,
+    fallback_prefix: str,
+) -> Path | None:
+    cfg_s = configured_root.strip() if isinstance(configured_root, str) else ""
+    prefixes = (cfg_s, str(base)) if cfg_s else (str(base), fallback_prefix)
+    for prefix in dict.fromkeys(p for p in prefixes if p):
+        rel = _match_prefix(raw, prefix)
+        if rel is not None:
+            cand = base / rel if rel else base
+            return resolve_under(base, cand)
+    return None
+
+
 def container_to_host_path(
     cfg: Any,
     raw_path: str | bytes | None,
@@ -214,28 +232,62 @@ def container_to_host_path(
     if not s or "\x00" in s:
         return None
 
-    base_music = Path(cfg.music_root)
-    bmr = getattr(cfg, "beets_music_root", "")
-    bmr_s = bmr.strip() if isinstance(bmr, str) else ""
-    music_prefixes = (bmr_s, str(base_music)) if bmr_s else (str(base_music), "/merged")
-    for prefix in dict.fromkeys(p for p in music_prefixes if p):
-        rel = _match_prefix(s, prefix)
-        if rel is not None:
-            cand = base_music / rel if rel else base_music
-            return resolve_under(base_music, cand)
+    hit = _resolve_mapped_root(
+        s, Path(cfg.music_root), getattr(cfg, "beets_music_root", ""), "/merged"
+    )
+    if hit is not None:
+        return hit
 
     if allow_quarantine:
-        base_q = Path(cfg.quarantine_dir)
-        bqr = getattr(cfg, "beets_quarantine_root", "")
-        bqr_s = bqr.strip() if isinstance(bqr, str) else ""
-        q_prefixes = (bqr_s, str(base_q)) if bqr_s else (str(base_q), "/quarantine")
-        for prefix in dict.fromkeys(p for p in q_prefixes if p):
-            rel = _match_prefix(s, prefix)
-            if rel is not None:
-                cand = base_q / rel if rel else base_q
-                return resolve_under(base_q, cand)
+        return _resolve_mapped_root(
+            s,
+            Path(cfg.quarantine_dir),
+            getattr(cfg, "beets_quarantine_root", ""),
+            "/quarantine",
+        )
 
     return None
+
+
+def dir_leaf(path: str | None) -> str:
+    """Return the final non-empty path component across POSIX or Windows slashes."""
+    if not path:
+        return ""
+    cleaned = str(path).rstrip("/\\").replace("\\", "/")
+    return cleaned.rsplit("/", 1)[-1] if cleaned else ""
+
+
+def extract_year(date_str: str | None) -> int:
+    """Extract a leading 4-digit year from an ISO-like date string, or 0."""
+    if not date_str:
+        return 0
+    s = str(date_str).strip()
+    return int(s[:4]) if len(s) >= 4 and s[:4].isdigit() else 0
+
+
+def extract_rgid_from_key(key: str | None) -> str | None:
+    """Extract a MusicBrainz release-group ID from a want key, if present."""
+    if not key:
+        return None
+    s = str(key)
+    for prefix in ("request:rg:", "release:rg:"):
+        if s.startswith(prefix):
+            val = s[len(prefix):].strip()
+            return val or None
+    return None
+
+
+def tail_file(path: str | os.PathLike[str], lines: int = 200, max_bytes: int = 262_144) -> str:
+    """Read the last *lines* lines of *path* (bounded by *max_bytes*)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    return "\n".join(raw.splitlines()[-lines:])
 
 
 def escape_like(term: str, escape: str = "\\") -> str:
@@ -337,6 +389,7 @@ __all__ = [
     "AUDIO_EXTENSIONS",
     "LOSSLESS_EXTENSIONS",
     "LOSSLESS_FORMATS",
+    "LOSSLESS_SQL",
     "PRIORITY_DEFAULT",
     "PRIORITY_MAX",
     "PRIORITY_MIN",
@@ -348,11 +401,15 @@ __all__ = [
     "blocklist_norm",
     "chunked",
     "container_to_host_path",
+    "dir_leaf",
     "escape_like",
     "extract_match_tokens",
+    "extract_rgid_from_key",
+    "extract_year",
     "norm_album",
     "norm_artist",
     "normalize",
     "resolve_under",
+    "tail_file",
     "tokens_match_path",
 ]

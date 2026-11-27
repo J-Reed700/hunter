@@ -14,26 +14,41 @@ from hunter.config import HunterConfig
 from hunter.db import open_readonly_db
 from hunter.domain import (
     LOSSLESS_FORMATS,
+    LOSSLESS_SQL,
     chunked,
     container_to_host_path,
     escape_like,
 )
 
-LOSSLESS = LOSSLESS_FORMATS
-_LOSSLESS_SQL = "(" + ",".join(f"'{fmt}'" for fmt in sorted(LOSSLESS_FORMATS)) + ")"
-_LOSSLESS_EXPR = f"UPPER(COALESCE(i.format,'')) IN {_LOSSLESS_SQL}"
+_LOSSLESS_EXPR = f"UPPER(COALESCE(i.format,'')) IN {LOSSLESS_SQL}"
 
 _ALBUM_TOTAL_SUBQUERY = """
 LEFT JOIN (
-    SELECT album_id, SUM(disc_total) AS expected_tracks
+    SELECT album_id,
+           CASE WHEN disctotal > 1 AND present_discs > 0 AND present_discs < disctotal THEN
+               MAX(known_total,
+                   (CASE WHEN known_total > 0 THEN known_total ELSE item_count END)
+                   + (disctotal - present_discs)
+                     * MAX(1, CAST(ROUND(1.0 * (CASE WHEN known_total > 0 THEN known_total ELSE item_count END) / present_discs) AS INTEGER)))
+           ELSE known_total END AS expected_tracks
     FROM (
-        SELECT album_id, COALESCE(NULLIF(disc, 0), 1) AS d,
-               COALESCE(MAX(tracktotal), 0) AS disc_total
-        FROM items
-        WHERE album_id IS NOT NULL
-        GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)
+        SELECT album_id,
+               SUM(disc_total) AS known_total,
+               SUM(disc_items) AS item_count,
+               COUNT(*) AS present_discs,
+               MAX(max_dt) AS disctotal
+        FROM (
+            SELECT album_id,
+                   COALESCE(NULLIF(disc, 0), 1) AS d,
+                   COUNT(id) AS disc_items,
+                   COALESCE(MAX(tracktotal), 0) AS disc_total,
+                   COALESCE(MAX(disctotal), 0) AS max_dt
+            FROM items
+            WHERE album_id IS NOT NULL
+            GROUP BY album_id, COALESCE(NULLIF(disc, 0), 1)
+        )
+        GROUP BY album_id
     )
-    GROUP BY album_id
 ) _at ON _at.album_id = a.id
 """
 
@@ -73,9 +88,6 @@ def text(raw: Any) -> str:
     if raw is None:
         return ""
     return raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
-
-
-_text = text
 
 
 def _chunked_in(col: str, values: list[str], negate: bool = False) -> tuple[str, list[str]]:
@@ -237,6 +249,7 @@ def _album_clauses(
     q: str = "",
     artist: str = "",
     genre: str = "",
+    label: str = "",
     year=None,
     decade=None,
     year_from=None,
@@ -269,6 +282,12 @@ def _album_clauses(
         else:
             where.append("a.genre = ?")
             args.append(genre)
+    if label:
+        if label == "__none__":
+            where.append("(a.label IS NULL OR a.label = '')")
+        else:
+            where.append("a.label = ?")
+            args.append(label)
     if year:
         where.append("a.year = ?")
         args.append(year)
@@ -309,13 +328,18 @@ def _album_clauses(
         if f == "incomplete":
             having.append("COUNT(i.id) < COALESCE(MAX(_at.expected_tracks),0)")
         elif f == "complete":
-            having.append("COUNT(i.id) >= COALESCE(MAX(_at.expected_tracks),0)")
+            having.append(
+                "COUNT(i.id) > 0 AND COUNT(i.id) >= COALESCE(MAX(_at.expected_tracks),0)"
+            )
         elif f == "noart":
             where.append("(a.artpath IS NULL OR a.artpath = '' OR a.artpath = X'')")
         elif f == "art":
             where.append("NOT (a.artpath IS NULL OR a.artpath = '' OR a.artpath = X'')")
         elif f == "lossy":
-            having.append(f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0")
+            having.append(
+                f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0"
+                f" AND COUNT(i.id) > 0"
+            )
         elif f == "lossless":
             having.append(
                 f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = COUNT(i.id)"
@@ -327,7 +351,7 @@ def _album_clauses(
                 f" BETWEEN 1 AND COUNT(i.id)-1"
             )
         elif f == "hires":
-            having.append("MAX(i.bitdepth) > 16 OR MAX(i.samplerate) > 48000")
+            having.append("(MAX(i.bitdepth) > 16 OR MAX(i.samplerate) > 48000)")
         elif f == "nombid":
             where.append("(a.mb_albumid IS NULL OR a.mb_albumid = '')")
         elif f == "mbid":
@@ -354,10 +378,10 @@ def _album_clauses(
             " LIKE ? ESCAPE '\\'"
         )
         hargs.append(f"%,{escape_like(fmt.upper())},%")
-    if min_tracks:
+    if min_tracks is not None:
         having.append("COUNT(i.id) >= ?")
         hargs.append(int(min_tracks))
-    if max_tracks:
+    if max_tracks is not None:
         having.append("COUNT(i.id) <= ?")
         hargs.append(int(max_tracks))
 
@@ -379,6 +403,7 @@ def albums(
     limit: int = 60,
     artist: str = "",
     genre: str = "",
+    label: str = "",
     year: int | None = None,
     decade: int | None = None,
     filt: str = "",
@@ -392,7 +417,7 @@ def albums(
     max_tracks: int | None = None,
 ) -> dict[str, Any]:
     sql, args = _album_clauses(
-        q=q, artist=artist, genre=genre, year=year, decade=decade,
+        q=q, artist=artist, genre=genre, label=label, year=year, decade=decade,
         year_from=year_from, year_to=year_to, filt=filt, fmt=fmt,
         albumtype=albumtype, added=added, letter=letter,
         min_tracks=min_tracks, max_tracks=max_tracks,
@@ -400,6 +425,7 @@ def albums(
     order = ALBUM_SORTS.get(sort, ALBUM_SORTS["added"])
     conn = connect(cfg)
     try:
+        conn.execute("BEGIN")
         total = conn.execute(f"SELECT COUNT(*) FROM ({sql})", args).fetchone()[0]
         rows = [
             dict(r)
@@ -447,7 +473,8 @@ _ALBUM_GROUP_KEYS = {
         " THEN UPPER(SUBSTR(artist,1,1)) ELSE '#' END"
     ),
     "quality": (
-        "CASE WHEN lossless_share >= 1 THEN 'lossless'"
+        "CASE WHEN tracks = 0 THEN 'empty'"
+        " WHEN lossless_share >= 1 THEN 'lossless'"
         " WHEN lossless_share > 0 THEN 'mixed' ELSE 'lossy' END"
     ),
     "format": "COALESCE(formats, '')",
@@ -474,6 +501,42 @@ def album_groups(
         ).fetchall()
     finally:
         conn.close()
+    if by == "format":
+        # Merge format-combo permutations ("FLAC,MP3" == "MP3,FLAC") deterministically.
+        merged: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            canon = ",".join(sorted(f.strip() for f in str(r[0]).split(",") if f.strip()))
+            cur = merged.get(canon)
+            if cur is None:
+                merged[canon] = {
+                    "key": canon,
+                    "albums": r[1],
+                    "tracks": r[2] or 0,
+                    "artists": r[3],
+                    "_ll_weighted": (r[4] or 0) * r[1],
+                    "_secs": r[5] or 0,
+                }
+            else:
+                cur["albums"] += r[1]
+                cur["tracks"] += r[2] or 0
+                cur["artists"] += r[3]
+                cur["_ll_weighted"] += (r[4] or 0) * r[1]
+                cur["_secs"] += r[5] or 0
+        ordered = sorted(merged.values(), key=lambda x: (-x["albums"], x["key"]))[:limit]
+        return {
+            "by": by,
+            "groups": [
+                {
+                    "key": g["key"],
+                    "albums": g["albums"],
+                    "tracks": g["tracks"],
+                    "artists": g["artists"],
+                    "lossless_share": round(g["_ll_weighted"] / max(g["albums"], 1), 3),
+                    "hours": round(g["_secs"] / 3600, 1),
+                }
+                for g in ordered
+            ],
+        }
     return {
         "by": by,
         "groups": [
@@ -493,18 +556,20 @@ def album_groups(
 def album(cfg: HunterConfig, album_id: int) -> dict[str, Any] | None:
     conn = connect(cfg)
     try:
+        conn.execute("BEGIN")
         head = conn.execute(
-            _ALBUM_SELECT + " WHERE a.id = ? GROUP BY a.id", (album_id,)
+            _ALBUM_SELECT.replace(
+                "a.mb_albumartistid, a.added AS album_added,",
+                "a.mb_albumartistid, a.added AS album_added, a.artpath,"
+                " a.albumartist_sort, a.albumstatus, a.albumdisambig,"
+                " a.catalognum, a.original_year,",
+            )
+            + " WHERE a.id = ? GROUP BY a.id",
+            (album_id,),
         ).fetchone()
         if not head:
             return None
         out = dict(head)
-        arow = conn.execute(
-            "SELECT artpath, albumartist_sort, albumstatus,"
-            " albumdisambig, catalognum, original_year, mb_albumartistid"
-            " FROM albums WHERE id=?",
-            (album_id,),
-        ).fetchone()
         items = [
             dict(r)
             for r in conn.execute(
@@ -520,24 +585,16 @@ def album(cfg: HunterConfig, album_id: int) -> dict[str, Any] | None:
     finally:
         conn.close()
 
-    art = host_path(cfg, arow["artpath"]) if arow else None
-    out["artpath"] = text(arow["artpath"]) if arow else ""
+    raw_art = out.get("artpath")
+    art = host_path(cfg, raw_art)
+    out["artpath"] = text(raw_art)
     out["art_exists"] = bool(art and art.is_file())
-    if arow:
-        out.update(
-            {
-                k: arow[k]
-                for k in (
-                    "albumartist_sort", "albumstatus", "albumdisambig",
-                    "catalognum", "original_year", "mb_albumartistid",
-                )
-            }
-        )
 
     dirs: set[str] = set()
     missing_files = 0
     disc_totals: dict[int, int] = {}
     have: set[tuple[int, int]] = set()
+    have_tracks_any_disc: set[int] = set()
 
     for it in items:
         raw_path = it["path"]
@@ -555,6 +612,7 @@ def album(cfg: HunterConfig, album_id: int) -> dict[str, Any] | None:
         disc_no = it["disc"] or 1
         if it["track"]:
             have.add((disc_no, it["track"]))
+            have_tracks_any_disc.add(it["track"])
         tt = it.get("tracktotal") or 0
         if tt > disc_totals.get(disc_no, 0):
             disc_totals[disc_no] = tt
@@ -563,19 +621,32 @@ def album(cfg: HunterConfig, album_id: int) -> dict[str, Any] | None:
     out["dirs"] = sorted(dirs)
     out["missing_files"] = missing_files
 
-    disctotal = out.get("disctotal") or 1
+    disctotal = min(int(out.get("disctotal") or 1), 100)
     missing_tracks: list[str] = []
     if disctotal <= 1:
-        total = out.get("tracktotal") or 0
+        total = min(int(out.get("tracktotal") or 0), 500)
         if total:
-            missing_tracks = [
-                str(n) for n in range(1, total + 1) if (1, n) not in have
-            ]
+            for n in range(1, total + 1):
+                if n not in have_tracks_any_disc:
+                    missing_tracks.append(str(n))
+                    if len(missing_tracks) >= 60:
+                        break
     else:
-        for d in sorted(disc_totals):
-            for n in range(1, disc_totals[d] + 1):
+        all_discs = sorted(set(disc_totals) | set(range(1, disctotal + 1)))
+        for d in all_discs:
+            dt = min(int(disc_totals.get(d, 0)), 500)
+            if dt <= 0:
+                missing_tracks.append(f"disc {d}")
+                if len(missing_tracks) >= 60:
+                    break
+                continue
+            for n in range(1, dt + 1):
                 if (d, n) not in have:
                     missing_tracks.append(f"{d}.{n}")
+                    if len(missing_tracks) >= 60:
+                        break
+            if len(missing_tracks) >= 60:
+                break
     out["missing_tracks"] = missing_tracks[:60]
     return out
 
@@ -592,17 +663,6 @@ def album_art_path(cfg: HunterConfig, album_id: int) -> Path | None:
         return None
     p = host_path(cfg, r["artpath"])
     return p if p and p.is_file() else None
-
-
-def album_rgid(cfg: HunterConfig, album_id: int) -> str:
-    conn = connect(cfg)
-    try:
-        r = conn.execute(
-            "SELECT mb_releasegroupid FROM albums WHERE id=?", (album_id,)
-        ).fetchone()
-        return (r[0] or "") if r else ""
-    finally:
-        conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -692,7 +752,10 @@ def _artist_clauses(
 
     for f in _split_filters(filt):
         if f == "lossy":
-            having.append(f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0")
+            having.append(
+                f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0"
+                f" AND COUNT(i.id) > 0"
+            )
         elif f == "lossless":
             having.append(
                 f"SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = COUNT(i.id)"
@@ -713,29 +776,27 @@ def _artist_clauses(
                 " THEN a.id END) > 0"
             )
         elif f == "noartistid":
-            where.append("(a.mb_albumartistid IS NULL OR a.mb_albumartistid = '')")
+            where.append(
+                "a.albumartist IN (SELECT DISTINCT albumartist FROM albums"
+                " WHERE mb_albumartistid IS NULL OR mb_albumartistid = '')"
+            )
         elif f == "nogenre":
             having.append("MIN(tg.genre) IS NULL")
         elif f == "incomplete":
             where.append(
-                "a.id IN ("
-                "  SELECT i2.album_id FROM items i2"
-                "  JOIN ("
-                "    SELECT album_id, SUM(dt) AS exp FROM ("
-                "      SELECT album_id, COALESCE(NULLIF(disc,0),1) AS d,"
-                "             COALESCE(MAX(tracktotal),0) AS dt"
-                "      FROM items WHERE album_id IS NOT NULL"
-                "      GROUP BY album_id, COALESCE(NULLIF(disc,0),1)"
-                "    ) GROUP BY album_id"
-                "  ) t2 ON t2.album_id = i2.album_id"
-                "  GROUP BY i2.album_id HAVING COUNT(i2.id) < MAX(t2.exp)"
-                ")"
+                f"a.albumartist IN ("
+                f"  SELECT DISTINCT a2.albumartist FROM albums a2"
+                f"  LEFT JOIN items i2 ON i2.album_id = a2.id"
+                f"  {_ALBUM_TOTAL_SUBQUERY.replace('a.id', 'a2.id')}"
+                f"  GROUP BY a2.id"
+                f"  HAVING COUNT(i2.id) < COALESCE(MAX(_at.expected_tracks), 0)"
+                f")"
             )
 
-    if min_albums:
+    if min_albums is not None:
         having.append("COUNT(DISTINCT a.id) >= ?")
         hargs.append(int(min_albums))
-    if max_albums:
+    if max_albums is not None:
         having.append("COUNT(DISTINCT a.id) <= ?")
         hargs.append(int(max_albums))
 
@@ -979,10 +1040,10 @@ def _track_clauses(
     elif fmt:
         where.append("UPPER(i.format) = ?")
         args.append(fmt)
-    if min_kbps:
+    if min_kbps is not None:
         where.append("i.bitrate >= ?")
         args.append(int(min_kbps) * 1000)
-    if max_kbps:
+    if max_kbps is not None:
         where.append("i.bitrate <= ?")
         args.append(int(max_kbps) * 1000)
     for f in _split_filters(filt):
@@ -1051,6 +1112,7 @@ def tracks(
     )
     conn = connect(cfg)
     try:
+        conn.execute("BEGIN")
         total = conn.execute(
             "SELECT COUNT(*)" + _TRACK_FROM + wsql, args
         ).fetchone()[0]
@@ -1061,7 +1123,8 @@ def tracks(
                 " i.album_id, a.year, i.genre, i.format, i.bitrate/1000 AS kbps,"
                 " i.bitdepth, i.samplerate, CAST(i.length AS INT) AS secs,"
                 " i.bpm, i.track, i.disc, a.mb_releasegroupid AS rgid,"
-                " i.added, i.mb_trackid, a.comp"
+                " i.added, i.mb_trackid, a.comp,"
+                f" CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END AS lossless"
                 + _TRACK_FROM
                 + wsql
                 + f" ORDER BY {_TRACK_SORTS.get(sort, _TRACK_SORTS['added'])}"
@@ -1202,6 +1265,7 @@ def duplicates(
     )
     conn = connect(cfg)
     try:
+        conn.execute("BEGIN")
         total, extra_tracks = conn.execute(
             f"SELECT COUNT(*), COALESCE(SUM(n - 1),0) FROM ({grp})", args
         ).fetchone()
@@ -1211,22 +1275,23 @@ def duplicates(
         ).fetchall()
         by_key: dict[str, list[dict[str, Any]]] = {k: [] for k, _, _ in keys}
         if keys:
-            for batch in chunked([k for k, _, _ in keys], 400):
-                ph = ",".join("?" * len(batch))
-                for r in conn.execute(
-                    f"SELECT {_DUP_KEY} AS k, i.id, i.artist, i.albumartist,"
-                    f" i.title, a.album, i.album_id, a.year, a.albumtype, a.comp,"
-                    f" i.format, i.bitrate/1000 AS kbps, i.bitdepth, i.samplerate,"
-                    f" CAST(i.length AS INT) AS secs, i.track, i.disc, i.added,"
-                    f" i.path, i.mb_trackid,"
-                    f" CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END AS lossless"
-                    + _TRACK_FROM
-                    + f" WHERE {_DUP_KEY} IN ({ph})",
-                    batch,
-                ):
-                    d = dict(r)
-                    d["path"] = text(d["path"])
-                    by_key[d.pop("k")].append(d)
+            key_list = [k for k, _, _ in keys]
+            k_clause, k_args = _chunked_in(_DUP_KEY, key_list, negate=False)
+            extra_where = f" AND ({' AND '.join(where)})" if where else ""
+            for r in conn.execute(
+                f"SELECT {_DUP_KEY} AS k, i.id, i.artist, i.albumartist,"
+                f" i.title, a.album, i.album_id, a.year, a.albumtype, a.comp,"
+                f" i.format, i.bitrate/1000 AS kbps, i.bitdepth, i.samplerate,"
+                f" CAST(i.length AS INT) AS secs, i.track, i.disc, i.added,"
+                f" i.path, i.mb_trackid,"
+                f" CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END AS lossless"
+                + _TRACK_FROM
+                + f" WHERE {k_clause}{extra_where}",
+                k_args + args,
+            ):
+                d = dict(r)
+                d["path"] = text(d["path"])
+                by_key[d.pop("k")].append(d)
         groups = []
         for k, n, waste in keys:
             rows = sorted(
@@ -1242,7 +1307,7 @@ def duplicates(
             groups.append(
                 {
                     "key": k,
-                    "count": n,
+                    "count": len(rows),
                     "waste_bytes": int(waste or 0),
                     "by": "mbid" if k.startswith("mb:") else "tags",
                     "suggest_keep": rows[0]["id"] if rows else None,
@@ -1407,34 +1472,121 @@ def albumtypes(cfg: HunterConfig) -> list[dict[str, Any]]:
         conn.close()
 
 
-def album_ids_by_rgid(cfg: HunterConfig, rgids: list[str]) -> dict[str, int]:
-    if not rgids:
-        return {}
+def gap_rows(
+    cfg: HunterConfig,
+    *,
+    coverage: float | None = None,
+    min_missing: int = 2,
+    min_expected: int = 4,
+    max_expected: int = 40,
+) -> list[tuple[int, str, str, int, int, int]]:
+    """Incomplete albums in beets: ``(id, artist, album, year, have, expected)``.
+
+    Uses ``_ALBUM_TOTAL_SUBQUERY`` so multi-disc albums with missing whole discs
+    are detected accurately alongside partial discs.
+    """
+    cov = cfg.owned_coverage if coverage is None else float(coverage)
     conn = connect(cfg)
     try:
-        out: dict[str, int] = {}
-        for batch in chunked(rgids, 400):
-            ph = ",".join("?" * len(batch))
-            for r in conn.execute(
-                f"SELECT mb_releasegroupid, id FROM albums"
-                f" WHERE mb_releasegroupid IN ({ph})",
-                batch,
-            ):
-                out[r[0]] = r[1]
-        return out
+        rows = conn.execute(
+            f"SELECT a.id, a.albumartist, a.album, COALESCE(a.year, 0) AS year,"
+            f"       COUNT(i.id) AS have,"
+            f"       COALESCE(MAX(_at.expected_tracks), 0) AS expected"
+            f" FROM albums a"
+            f" JOIN items i ON i.album_id = a.id"
+            f" {_ALBUM_TOTAL_SUBQUERY}"
+            f" WHERE a.albumartist NOT IN ('', 'Various Artists')"
+            f"   AND LOWER(a.albumartist) != 'various artists'"
+            f"   AND a.album != ''"
+            f" GROUP BY a.id"
+            f" HAVING expected BETWEEN ? AND ?"
+            f"    AND have * 1.0 / expected < ?"
+            f"    AND expected - have >= ?"
+            f" ORDER BY have * 1.0 / expected, a.id",
+            (min_expected, max_expected, cov, min_missing),
+        ).fetchall()
+        return [
+            (
+                int(r["id"]),
+                str(r["albumartist"]),
+                str(r["album"]),
+                int(r["year"] or 0),
+                int(r["have"]),
+                int(r["expected"]),
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def lossy_rows(
+    cfg: HunterConfig,
+    *,
+    min_tracks: int = 4,
+) -> list[tuple[int, str, str, int, int]]:
+    """Zero-lossless albums in beets: ``(id, artist, album, year, n)``."""
+    conn = connect(cfg)
+    try:
+        rows = conn.execute(
+            f"SELECT a.id, a.albumartist, a.album, COALESCE(a.year, 0) AS year,"
+            f"       COUNT(i.id) AS n"
+            f" FROM albums a"
+            f" JOIN items i ON i.album_id = a.id"
+            f" WHERE a.albumartist NOT IN ('', 'Various Artists')"
+            f"   AND LOWER(a.albumartist) != 'various artists'"
+            f"   AND a.album != ''"
+            f" GROUP BY a.id"
+            f" HAVING n >= ?"
+            f"    AND SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END) = 0"
+            f" ORDER BY n DESC, a.id",
+            (min_tracks,),
+        ).fetchall()
+        return [
+            (
+                int(r["id"]),
+                str(r["albumartist"]),
+                str(r["album"]),
+                int(r["year"] or 0),
+                int(r["n"]),
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def pulse_counts(cfg: HunterConfig) -> dict[str, Any]:
+    """Lightweight library counters for the Dashboard pulse endpoint."""
+    conn = connect(cfg)
+    try:
+        conn.execute("BEGIN")
+        now = time.time()
+        albums_n = conn.execute("SELECT COUNT(*) FROM albums").fetchone()[0]
+        items_n, lossless_n, a24, a7 = conn.execute(
+            f"SELECT COUNT(*),"
+            f"       COALESCE(SUM(CASE WHEN {_LOSSLESS_EXPR} THEN 1 ELSE 0 END), 0),"
+            f"       COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0),"
+            f"       COALESCE(SUM(CASE WHEN added > ? THEN 1 ELSE 0 END), 0)"
+            f" FROM items i",
+            (now - 86_400, now - 604_800),
+        ).fetchone()
+        return {
+            "albums": int(albums_n or 0),
+            "items": int(items_n or 0),
+            "lossless_pct": round(100.0 * (lossless_n or 0) / items_n, 1) if items_n else 0.0,
+            "added_24h": int(a24 or 0),
+            "added_7d": int(a7 or 0),
+        }
     finally:
         conn.close()
 
 
 __all__ = [
-    "ALBUM_SORTS",
-    "LOSSLESS",
     "album",
     "album_art_path",
     "album_groups",
     "album_ids",
-    "album_ids_by_rgid",
-    "album_rgid",
     "albums",
     "albumtypes",
     "artist",
@@ -1443,10 +1595,13 @@ __all__ = [
     "artists",
     "connect",
     "duplicates",
+    "gap_rows",
     "genres",
     "host_path",
     "junk",
+    "lossy_rows",
     "overview",
+    "pulse_counts",
     "text",
     "track",
     "track_groups",
