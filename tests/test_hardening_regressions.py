@@ -711,5 +711,164 @@ class WebSecurityAndRoutesRegressions(unittest.TestCase):
                 self.assertNotIn("-a", captured_argv[0])
 
 
+class BundledStandaloneHelpersRegressions(unittest.TestCase):
+    def test_native_blocklist_fallback_works_without_docker_or_beets_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = _cfg(
+                state_dir=root / "state",
+                beets_automation_dir=root / "nonexistent_auto",
+            )
+            blocklist.invalidate()
+            self.assertFalse(blocklist.uses_external(cfg))
+            self.assertTrue(blocklist.available(cfg))
+            self.assertEqual(blocklist.entries(cfg), [])
+
+            no_docker = mock.MagicMock()
+            no_docker.available = False
+            res = libops.blocklist_edit(
+                cfg, no_docker, add=["The Beatles", "beatles", "Radiohead"], remove=[]
+            )
+            self.assertTrue(res["ok"], res)
+            self.assertEqual(res["added"], ["The Beatles", "Radiohead"])
+            self.assertEqual(res["skipped"], ["beatles"])
+            self.assertEqual(res["count"], 2)
+            self.assertTrue(blocklist.is_blocked("Beatles", cfg))
+            self.assertTrue((root / "state" / "artist_blocklist.txt").is_file())
+
+            res2 = libops.blocklist_edit(cfg, no_docker, add=[], remove=["beatles", "Nobody"])
+            self.assertTrue(res2["ok"], res2)
+            self.assertEqual(res2["removed"], ["beatles"])
+            self.assertEqual(res2["missing"], ["Nobody"])
+            self.assertEqual(res2["count"], 1)
+            self.assertFalse(blocklist.is_blocked("The Beatles", cfg))
+            self.assertTrue(blocklist.is_blocked("Radiohead", cfg))
+
+    def test_bundled_library_remove_preflight_remove_and_undo_end_to_end(self) -> None:
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            music = root / "music"
+            quarantine = root / "quarantine"
+            album_dir = music / "Band" / "Debut"
+            album_dir.mkdir(parents=True)
+            quarantine.mkdir(parents=True)
+            track_path = album_dir / "01.flac"
+            art_path = album_dir / "cover.jpg"
+            nfo_path = album_dir / "info.nfo"
+            track_path.write_bytes(b"fLaC-audio-data")
+            art_path.write_bytes(b"\xff\xd8\xff-jpg")
+            nfo_path.write_text("liner notes", encoding="utf-8")
+
+            db_path = root / "musiclibrary.db"
+            conn = _make_beets_db(db_path)
+            try:
+                conn.execute(
+                    "INSERT INTO albums(id, albumartist, album, year, artpath, added) VALUES(1, 'Band', 'Debut', 2022, ?, ?)",
+                    (str(art_path).encode("utf-8"), time.time()),
+                )
+                conn.execute(
+                    "INSERT INTO album_attributes(entity_id, key, value) VALUES(1, 'mood', 'energetic')"
+                )
+                conn.execute(
+                    "INSERT INTO items(id, album_id, artist, album, albumartist, title, track, tracktotal, length, bitrate, format, path, added) "
+                    "VALUES(10, 1, 'Band', 'Debut', 'Band', 'Track One', 1, 1, 180, 900000, 'FLAC', ?, ?)",
+                    (str(track_path).encode("utf-8"), time.time()),
+                )
+                conn.execute(
+                    "INSERT INTO item_attributes(entity_id, key, value) VALUES(10, 'rating', '5')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            cfg = _cfg(
+                state_dir=root / "state",
+                beets_db=db_path,
+                music_root=music,
+                quarantine_dir=quarantine,
+                beets_music_root=str(music),
+                beets_quarantine_root=str(quarantine),
+                beets_automation_dir=root / "nonexistent_auto",
+                beets_python=sys.executable,
+                storage_fstype="",
+            )
+
+            def run_bundled(extra_args: list[str]) -> tuple[int, dict]:
+                argv, env, is_bundled = libops._removal_exec_spec(cfg, ["--db", str(db_path), *extra_args])
+                self.assertTrue(is_bundled)
+                proc = subprocess.run(
+                    argv,
+                    env={**os.environ, **(env or {})},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                parsed = libops._parse_result_json(proc.stdout)
+                self.assertIsNotNone(parsed, f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+                return proc.returncode, parsed
+
+            # 1. Preflight
+            rc, pf = run_bundled(["--preflight"])
+            self.assertEqual(rc, 0, pf)
+            self.assertTrue(pf["ok"])
+            self.assertGreater(pf["quarantine"]["free_bytes"], 0)
+
+            # 2. Journaled removal
+            rc, rem = run_bundled(["--artist=Band", "--apply", "--requested-by=admin1", "--job-id=j_test_1"])
+            self.assertEqual(rc, 0, rem)
+            self.assertTrue(rem["ok"])
+            self.assertEqual(rem["moved"], 1)
+            self.assertEqual(rem["albums_removed"], 1)
+            self.assertFalse(track_path.exists())
+            self.assertFalse(art_path.exists())
+            self.assertFalse(nfo_path.exists())
+            self.assertFalse(album_dir.exists())
+
+            # Manifest readable by libops.removals()
+            runs = libops.removals(cfg)
+            self.assertEqual(len(runs), 1)
+            run_id = runs[0]["id"]
+            self.assertEqual(runs[0]["job_id"], "j_test_1")
+            detail = libops.removal(cfg, run_id)
+            self.assertIsNotNone(detail)
+
+            # DB rows removed
+            c = sqlite3.connect(str(db_path))
+            try:
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM items").fetchone()[0], 0)
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM albums").fetchone()[0], 0)
+            finally:
+                c.close()
+
+            # 3. Undo restores files, DB rows, and flex attributes
+            rc, undo = run_bundled(["--undo", detail["manifest"], "--apply"])
+            self.assertEqual(rc, 0, undo)
+            self.assertTrue(undo["ok"])
+            self.assertTrue(track_path.is_file())
+            self.assertEqual(track_path.read_bytes(), b"fLaC-audio-data")
+            self.assertTrue(art_path.is_file())
+            self.assertTrue(nfo_path.is_file())
+
+            c = sqlite3.connect(str(db_path))
+            try:
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM items WHERE id=10").fetchone()[0], 1)
+                self.assertEqual(c.execute("SELECT COUNT(*) FROM albums WHERE id=1").fetchone()[0], 1)
+                self.assertEqual(
+                    c.execute("SELECT value FROM item_attributes WHERE entity_id=10 AND key='rating'").fetchone()[0],
+                    "5",
+                )
+                self.assertEqual(
+                    c.execute("SELECT value FROM album_attributes WHERE entity_id=1 AND key='mood'").fetchone()[0],
+                    "energetic",
+                )
+            finally:
+                c.close()
+
+            self.assertTrue(libops.removal(cfg, run_id)["undone_ts"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
 services:
   hunter:
-    build: .
+    image: ghcr.io/j-reed700/hunter:latest
+    # Or build locally from a cloned repo instead of pulling from GHCR:
+    # build: .
     container_name: hunter
     restart: unless-stopped
     env_file:

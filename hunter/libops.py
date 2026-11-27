@@ -19,12 +19,14 @@ removal can run at all BEFORE queuing one (removal_preflight).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import re
 import threading
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,6 +43,45 @@ log = logging.getLogger("hunter.libops")
 PRUNE_SUBDIR = "library_prune"
 HUGE = 5000                       # mirrors the script's --allow-huge cap
 TYPED_CONFIRM_TRACKS = 30         # UI: ask to type the name above this
+
+_HELPER_BOOTSTRAP = (
+    "import base64,os,sys,zlib;"
+    "ns={'__name__':'__main__','__file__':'<hunter:library_remove>'};"
+    "exec(compile(zlib.decompress(base64.b64decode(os.environ.pop('_HUNTER_HELPER_B64'))),ns['__file__'],'exec'),ns)"
+)
+_BUNDLED_HELPER_B64: str | None = None
+
+
+def _bundled_removal_b64() -> str:
+    global _BUNDLED_HELPER_B64
+    if _BUNDLED_HELPER_B64 is None:
+        src = (Path(__file__).resolve().parent / "helpers" / "library_remove.py").read_bytes()
+        _BUNDLED_HELPER_B64 = base64.b64encode(zlib.compress(src, 9)).decode("ascii")
+    return _BUNDLED_HELPER_B64
+
+
+def _uses_external_removal_script(cfg: HunterConfig) -> bool:
+    auto = getattr(cfg, "beets_automation_dir", None)
+    return bool(auto and (Path(auto) / "jobs" / "library_remove.py").is_file())
+
+
+def _removal_exec_spec(
+    cfg: HunterConfig, extra_args: list[str]
+) -> tuple[list[str], dict[str, str] | None, bool]:
+    """Return ``(argv, env, is_bundled)`` for executing ``library_remove.py`` in beets."""
+    py = hunter_config.beets_python_bin(cfg)
+    if _uses_external_removal_script(cfg):
+        return [py, hunter_config.beets_job_script(cfg, "library_remove.py"), *extra_args], None, False
+    argv = [
+        py, "-c", _HELPER_BOOTSTRAP,
+        "--music-root", str(getattr(cfg, "beets_music_root", None) or cfg.music_root),
+        "--quarantine-root", hunter_config.beets_quarantine_root_str(cfg),
+    ]
+    fstype = (getattr(cfg, "storage_fstype", "") or "").strip()
+    if fstype:
+        argv += ["--required-fstype", fstype]
+    argv += extra_args
+    return argv, {"_HUNTER_HELPER_B64": _bundled_removal_b64()}, True
 
 
 def _parse_result_json(text: str) -> dict | None:
@@ -252,23 +293,21 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
     kind="library" finalizer) does the confirm/compensate half."""
     t = plan["targets"]
     job_id = jobs.new_id("library")
-    argv = [
-        hunter_config.beets_python_bin(cfg),
-        hunter_config.beets_job_script(cfg, "library_remove.py"),
-    ]
+    extra_args: list[str] = []
     for a in t["artists"]:
-        argv.append(f"--artist={a}")
+        extra_args.append(f"--artist={a}")
     for aid in t["album_ids"]:
-        argv += ["--album-id", str(aid)]
+        extra_args += ["--album-id", str(aid)]
     for iid in t["item_ids"]:
-        argv += ["--item-id", str(iid)]
-    argv += ["--apply", f"--requested-by={requested_by or 'ui'}", "--job-id", job_id]
+        extra_args += ["--item-id", str(iid)]
+    extra_args += ["--apply", f"--requested-by={requested_by or 'ui'}", "--job-id", job_id]
     if block:
-        argv.append("--block")
+        extra_args.append("--block")
     if reason:
-        argv.append(f"--reason={reason[:200]}")
+        extra_args.append(f"--reason={reason[:200]}")
     if allow_huge:
-        argv.append("--allow-huge")
+        extra_args.append("--allow-huge")
+    argv, env, is_bundled = _removal_exec_spec(cfg, extra_args)
     label = _label(plan)
     # artist-wide parking ONLY for explicit artist targets — an album
     # removal must not park the artist's other wants
@@ -277,6 +316,7 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
                  "artists": t["artists"], "park_keys": park_keys,
                  "label": label, "tracks": plan["tracks"],
                  "album_rows": plan["album_rows"], "block": bool(block),
+                 "bundled_block": bool(block and is_bundled and not blocklist.uses_external(cfg)),
                  "reason": reason, "requested_by": requested_by or "ui"}
 
     from hunter.state import HunterState
@@ -288,6 +328,7 @@ def start_removal(cfg: HunterConfig, jobs: Jobs, plan: dict, *, block: bool,
     try:
         res = jobs.start_beets(
             kind="library", title=f"Remove {label}", argv=argv, mode="apply",
+            env=env,
             meta={"op": "remove", "artists": t["artists"], "album_ids": t["album_ids"][:50],
                   "item_ids": t["item_ids"][:50], "tracks": plan["tracks"],
                   "album_rows": plan["album_rows"], "block": block, "reason": reason,
@@ -353,6 +394,11 @@ def _finish_removal(cfg: HunterConfig, job: dict, meta: dict) -> None:
     from hunter.state import HunterState
     with HunterState(cfg.state_db) as st:
         if (job["status"] == "ok" and result.get("ok") is not False) or touched:
+            if side.get("bundled_block") and side.get("artists"):
+                try:
+                    blocklist.add_entries(side["artists"], cfg)
+                except OSError as exc:
+                    log.warning("native blocklist update failed after removal %s: %s", job["id"], exc)
             unfollowed: list[str] = []
             if side.get("unfollow") and side.get("artists"):
                 low = {n.casefold() for n in side["artists"]}
@@ -448,15 +494,13 @@ def removal_preflight(cfg: HunterConfig, *, max_age: float = 30.0,
                 res = {"ok": False, "error": "docker socket not mounted — beets console offline"}
             else:
                 try:
+                    pf_argv, pf_env, _ = _removal_exec_spec(cfg, ["--preflight"])
                     r = docker.exec_run(
                         cfg.beets_container,
-                        [
-                            hunter_config.beets_python_bin(cfg),
-                            hunter_config.beets_job_script(cfg, "library_remove.py"),
-                            "--preflight",
-                        ],
+                        pf_argv,
                         user=hunter_config.beets_exec_user_str(cfg),
                         timeout=25,
+                        env=pf_env,
                     )
                     parsed = _parse_result_json(r["output"])
                     res = parsed if parsed is not None else {
@@ -580,14 +624,12 @@ def start_undo(cfg: HunterConfig, jobs: Jobs, run_id: str, requested_by: str) ->
         return {"ok": False, "error": "unknown removal"}
     if s.get("undone_ts"):
         return {"ok": False, "error": "already undone"}
+    argv, env, _ = _removal_exec_spec(cfg, ["--undo", s["manifest"], "--apply"])
     res = jobs.start_beets(
         kind="library", title=f"Undo removal · {', '.join(s['artists'][:2]) or run_id}",
-        argv=[
-            hunter_config.beets_python_bin(cfg),
-            hunter_config.beets_job_script(cfg, "library_remove.py"),
-            "--undo", s["manifest"], "--apply",
-        ],
+        argv=argv,
         mode="apply",
+        env=env,
         meta={"op": "undo", "removal": run_id, "requested_by": requested_by},
         exclusive="library:remove")
     if res["ok"]:
@@ -621,8 +663,30 @@ def blocklist_view(q: str = "", cfg: HunterConfig | None = None) -> dict:
 
 def blocklist_edit(cfg: HunterConfig, docker: DockerClient, *, add: list[str],
                    remove: list[str]) -> dict:
-    """Attached exec of blocklist_ctl.py (fast: one file rewrite)."""
+    """Update the artist blocklist — natively in ``/state`` when no external
+    beets automation directory is mounted, or via ``blocklist_ctl.py`` inside
+    the beets container when one is present."""
     out: dict = {"ok": True, "added": [], "skipped": [], "removed": [], "missing": []}
+    if not blocklist.uses_external(cfg):
+        try:
+            add_clean = [n.strip() for n in add if n and n.strip()][:200]
+            rem_clean = [n.strip() for n in remove if n and n.strip()][:200]
+            if add_clean:
+                added, skipped, total = blocklist.add_entries(add_clean, cfg)
+                out["added"] = added
+                out["skipped"] = skipped
+                out["count"] = total
+            if rem_clean:
+                removed, missing, total = blocklist.remove_entries(rem_clean, cfg)
+                out["removed"] = removed
+                out["missing"] = missing
+                out["count"] = total
+            if "count" not in out:
+                out["count"] = blocklist.size(cfg)
+            return out
+        except OSError as exc:
+            return {**out, "ok": False, "error": str(exc)}
+
     if not docker.available:
         return {"ok": False, "error": "docker socket not mounted"}
     changed = False
